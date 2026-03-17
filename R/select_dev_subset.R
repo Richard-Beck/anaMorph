@@ -1,8 +1,8 @@
 parse_args <- function(args) {
   parsed <- list(
-    out_image_csv = "data/dev_subset_images.csv",
-    out_id_csv = "data/dev_subset_ids.csv",
-    copy_script = "data/copy_dev_subset.sh",
+    out_image_csv = "manifests/dev_subset_images.csv",
+    out_id_csv = "manifests/dev_subset_ids.csv",
+    copy_script = "scripts/copy_dev_subset.sh",
     n_groups = "4",
     ids_per_group = "4"
   )

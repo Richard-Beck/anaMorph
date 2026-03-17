@@ -2,8 +2,8 @@ parse_args <- function(args) {
   parsed <- list(
     passaging_csv = "core_data/passaging.csv",
     media_csv = "core_data/media.csv",
-    out_csv = "data/image_manifest.csv",
-    out_id_csv = "data/image_id_summary.csv"
+    out_csv = "manifests/image_manifest.csv",
+    out_id_csv = "manifests/image_id_summary.csv"
   )
 
   i <- 1

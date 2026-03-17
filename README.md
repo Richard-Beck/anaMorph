@@ -27,27 +27,28 @@ Rscript R/index_hpc_images.R \
   --hpc_dir /share/lab_crd/lab_crd/CLONEID/data/LTEEs \
   --passaging_csv core_data/passaging.csv \
   --media_csv core_data/media.csv \
-  --out_csv data/image_manifest.csv \
-  --out_id_csv data/image_id_summary.csv
+  --out_csv manifests/image_manifest.csv \
+  --out_id_csv manifests/image_id_summary.csv
 ```
 
 Select a local dev subset:
 
 ```bash
 Rscript R/select_dev_subset.R \
-  --manifest_csv data/image_manifest.csv \
-  --out_image_csv data/dev_subset_images.csv \
-  --out_id_csv data/dev_subset_ids.csv \
-  --copy_script data/copy_dev_subset.sh \
+  --manifest_csv manifests/image_manifest.csv \
+  --out_image_csv manifests/dev_subset_images.csv \
+  --out_id_csv manifests/dev_subset_ids.csv \
+  --copy_script scripts/copy_dev_subset.sh \
   --n_groups 4 \
   --ids_per_group 4
 ```
 
-The subset script writes a bash copy script that can be run on HPC after you adjust the destination path.
+The manifest CSVs and copy script are intended to be tracked in git and synchronized between local and HPC copies of the repo. Only the copied raw dev images should stay untracked.
 
 ## Design intent
 
 - Do not change the canonical HPC folder layout.
 - Prefer manifests, summaries, and symlinked working views over file moves.
 - Keep only code, metadata, and a small dev subset in the local repo.
+- Keep syncable manifests and subset definitions under tracked paths in the repo.
 - Treat segmentation as an external dependency until the model invocation and outputs are pulled into versioned pipeline code.
