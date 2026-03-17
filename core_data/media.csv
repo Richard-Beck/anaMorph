@@ -1,0 +1,109 @@
+id,base1,base1_pct,base2,base2_pct,FBS,FBS_pct,EnergySource2,EnergySource2_pct,EnergySource,EnergySource_nM,HEPES,HEPES_mM,Salt,Salt_nM,antibiotic,antibiotic_pct,growthFactors,antibiotic2,antibiotic2_pct,antimycotic,antimycotic_pct,Stressor,Stressor_concentration,Stressor_unit,comment,antibiotic3,antibiotic4,antibiotic3_pct,antibiotic4_pct,oxygen_pct,export4pub
+8,RPMI-1640,45,EMEM,45,FBS_heat_inactivated,10,,0,,0,,0,,0,,0,,,0,,0,,,,,,,0,0,20.5,0
+9,EMEM,90,,0,FBS,10,NEAA,1,L_glutamine,2e+06,,0,,0,,0,,,0,,0,,,,,,,0,0,20.5,0
+10,EBSS,100,,0,,0,,0,,0,,0,,0,,0,,,0,,0,,,,,,,0,0,20.5,0
+11,IMDM,80,,0,FBS,20,,0,,0,,0,,0,,0,,,0,,0,,,,,,,0,0,20.5,0
+13,RPMI-1640,90,,0,FBS,10,,0,,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+14,RPMI-1640,90,,0,FBS_heat_inactivated,10,,0,,0,,0,,0,,0,,,0,,0,,,,,,,0,0,20.5,0
+15,RPMI-1640,90,,0,FBS_heat_inactivated,10,,0,L_glutamine,2e+06,HEPES,25,NaHCO3,25,,0,,,0,,0,,,,,,,0,0,20.5,0
+18,RPMI-1640,90,,0,FBS,10,,,Insulin,10,,0,,,,0,,,0,,0,,,,,,,0,0,20.5,0
+19,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+20,RPMI-1640,90,,0,FBS,10,Sodium Pyruvate,0.01,L_glutamine,2e+06,HEPES,10,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+21,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Dihydrocytochalasin B (DCB),2,,,,,0,0,20.5,0
+22,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,MLN8237,0.100000001490116,,,,,0,0,20.5,0
+23,RPMI-1640,90,,0,dFBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,MLN8237,0.100000001490116,,,,,0,0,20.5,0
+24,RPMI-1640,90,,0,dFBS,10,Phosphates,0,L_glutamine,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+25,RPMI-1640,90,,0,dFBS,10,,0,L_glutamine,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+26,RPMI-1640,10,PBS,90,dFBS,10,,0,,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+27,RPMI-1640,90,,0,dFBS,10,,0,Folic acid,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+28,RPMI-1640,25,PBS,75,dFBS,10,,0,,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+31,IMDM,80,,0,FBS,20,,0,,0,,0,,0,,0,,,0,,0,AZD4547,5,nMol,,,,0,0,20.5,0
+32,IMDM,80,,0,FBS,20,,0,,0,,0,,0,,0,,,0,,0,AZD4547,10,nMol,,,,0,0,20.5,0
+34,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,4,pMol,,,,0,0,20.5,0
+35,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,2,pMol,,,,0,0,20.5,0
+36,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,DMSO,0.0020000000949949,mMol,,,,0,0,20.5,0
+38,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,5,pMol,,,,0,0,20.5,0
+39,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,10,pMol,,,,0,0,20.5,0
+40,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,15,pMol,,,,0,0,20.5,0
+41,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,20,pMol,,,,0,0,20.5,0
+42,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,DMSO,0.00999999977648258,mMol,,,,0,0,20.5,0
+43,EMEM,90,,0,FBS,10,NEAA,1,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+44,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,0.100000001490116,nMol,,,,0,0,20.5,0
+45,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,0.25,nMol,,,,0,0,20.5,0
+46,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,0.75,nMol,,,,0,0,20.5,0
+47,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,1.5,nMol,,,,0,0,20.5,0
+48,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,DMSO,1.5,nMol,,,,0,0,20.5,0
+49,RPMI-1640,90,,0,FBS,10,,0,L_glutamine,2e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,Vinblastine,1,nMol,,,,0,0,20.5,0
+50,RPMI-1640,90,,0,FBS,10,,,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,Vinblastine,0.5,nMol,,,,0,0,20.5,0
+51,DMEM,90,,0,FBS,10,Insulin,0.1,,,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+52,RPMI-1640 (ATCC modification),90,,0,FBS,10,,0,L_glutamine,2e+06,HEPES,10,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+53,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+54,Ham_F12,45,DMEM,45,FBS,10,,,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+55,DMEM,90,,0,FBS,10,Glucose (mM),1,L_glutamine,2e+06,,0,,,,0,,,0,,0,,,,,,,0,0,20.5,0
+56,DMEM,90,,0,FBS,10,,,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+57,MEM,90,,0,FBS,10,,,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+58,Ham_F12,90,,0,FBS,10,,,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+59,MEM,45,RPMI-1640,45,FBS,10,,,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+60,MEBM,47.5,DMEM(F12),47.5,FBS,5,,,,,,0,,,,0,,,0,,0,,,,,,,0,0,20.5,0
+61,Ham_F12,45,RPMI-1640,45,FBS,10,,,,0,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+62,Ham_F12K,90,,0,FBS,10,,,,0,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+63,WILLIAMS,90,,0,FBS,10,,,,0,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+64,HYBRICARE,90,,0,FBS,10,,,,0,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+65,DMEM(F12),95,,0,Horse Serum,5,Insulin,0.1,Hydrocortisone,500,,0,,,streptomycin,1,EGF,Penicillin,1,,0,Cholera Toxin,100,"",,,,0,0,20.5,0
+67,Medium-199,45,MCDB-15,45,FBS,10,,,,0,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+68,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,G418,,0.00400000018998981,0,20.5,0
+69,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,Puromycin,Blasticidin,0.000500000023748726,0.0020000000949949,20.5,0
+70,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,Puromycin,,0.000500000023748726,0,20.5,0
+71,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Gemcitabine,50,nMol,,,,0.000500000023748726,0,20.5,0
+72,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Gemcitabine,100,nMol,,,,0.000500000023748726,0,20.5,0
+73,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Gemcitabine,200,nMol,,,,0.000500000023748726,0,20.5,0
+74,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Gemcitabine,400,nMol,,,,0.000500000023748726,0,20.5,0
+75,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Gemcitabine,800,nMol,,,,0.000500000023748726,0,20.5,0
+76,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,0,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+77,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,10,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+78,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,5,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+79,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,2.5,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+80,FluoroBrite DMEM,90,,0,FBS,10,,,GlutaMAX,200,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+81,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,Puromycin,Blasticidin,0,0,20.5,0
+82,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+83,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,3e+06,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+84,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,10,L_glutamine,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+85,RPMI-1640 (modified),90,,0,dFBS,10,,0,,0,,0,,0,streptomycin,1,,Penicillin,1,,0,Reversine,500,nMol,,,,0,0,20.5,0
+86,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,1500000,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+87,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,5,L_glutamine,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+88,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,750000,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+89,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,2.5,L_glutamine,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+90,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,375000,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+91,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,1.25,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+92,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,187500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+93,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,0.625,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+94,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,93750,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+95,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,46875,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+96,RPMI-1640 (modified),90,,0,dFBS,10,,0,Glucose,0,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+97,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,0.3125,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+98,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,0.15625,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+99,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,0.078,L_glutamine,2e+06,,0,,,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,20.5,0
+100,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,2,0
+101,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,1,0
+102,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,0.5,0
+103,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,0.3,0
+104,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,0.2,0
+105,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,0.1,0
+106,RPMI-1640 (modified),90,,0,dFBS,10,Phosphates,100,Glucose,11101500,,0,,0,streptomycin,1,,Penicillin,1,,0,,,,,,,0,0,0,0
+110,RPMI-1640 (modified),90,,0,dFBS,10,,0,,,,0,,0,streptomycin,1,,Penicillin,1,Fungizone,1,,,,,,,0,0,20.5,0
+111,RHB-A,100,,0,,0,,,,,,0,,,streptomycin,1,EGF+FGF,Penicillin,1,Fungizone,1,,,,,,,0,0,20.5,0
+120,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Palbociclib,2,uMol,,,,0.000500000023748726,0,20.5,0
+121,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Abemaciclib,2,uMol,,,,0.000500000023748726,0,20.5,0
+122,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,JQ1,0.25,uMol,,,,0.000500000023748726,0,20.5,0
+123,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Dicytochalasin B,2,uMol,,,,0.000500000023748726,0,20.5,0
+124,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,MLN8237,0.100000001490116,uMol,,,,0.000500000023748726,0,20.5,0
+125,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,VX680,0.5,uMol,,,,0.000500000023748726,0,20.5,0
+126,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,GSK1070916,0.100000001490116,uMol,,,,0.000500000023748726,0,20.5,0
+127,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Danusertib,0.5,uMol,,,,0.000500000023748726,0,20.5,0
+128,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Dinaciclib,0.100000001490116,uMol,,,,0.000500000023748726,0,20.5,0
+129,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Milciclib,10,uMol,,,,0.000500000023748726,0,20.5,0
+130,McCoy's 5A (Modified),90,,0,FBS,10,,,,,,0,,,streptomycin,1,,Penicillin,1,,0,Adavociclib,2,uMol,,,,0.000500000023748726,0,20.5,0
+133,"NGS mouse, strain 5557, female",100,,0,,,,,,,,,,,,,,,,,,,,,,,,,,20.5,0
+134,"NGS mouse, strain 5557, female",100,,0,,,,,,,,,,,,,,,,,,Gemcitabine,,,,,,,,20.5,0
+135,Plasma,100,,0,,,,,,,,,,,,,,,,,,,,,,,,,,20.5,0
+136,Plasma,100,,0,,,,,,,,,,,,,,,,,,Temozolomide,,,,,,,,20.5,0
