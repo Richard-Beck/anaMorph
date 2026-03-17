@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--run-manifest", default="manifests/dev_subset_segmentation_runs.csv")
     parser.add_argument("--image-manifest", default="manifests/dev_subset_segmentation_images.csv")
     parser.add_argument("--run-label", default="")
+    parser.add_argument("--preferred-field", default="bl")
     return parser.parse_args()
 
 
@@ -35,6 +36,16 @@ def normalize_relpath(path):
     return path.replace("\\", "/")
 
 
+def select_one_field_per_id(manifest, preferred_field):
+    field_order = [preferred_field, "bl", "br", "tl", "tr"]
+    priority = {field: idx for idx, field in enumerate(field_order)}
+
+    manifest = manifest.copy()
+    manifest["field_priority"] = manifest["field"].map(lambda x: priority.get(x, len(priority)))
+    manifest = manifest.sort_values(["id", "field_priority", "filename"]).drop_duplicates(subset=["id"], keep="first")
+    return manifest.drop(columns=["field_priority"])
+
+
 def main():
     args = parse_args()
     io.logger_setup()
@@ -42,6 +53,7 @@ def main():
     manifest = pd.read_csv(args.manifest_csv)
     if manifest.empty:
         raise SystemExit("No rows found in manifest.")
+    manifest = select_one_field_per_id(manifest, args.preferred_field)
 
     files = manifest["filepath"].tolist()
     imgs = [imread(path) for path in files]
@@ -93,6 +105,7 @@ def main():
         "manifest_csv": normalize_relpath(args.manifest_csv),
         "pretrained_model": args.pretrained_model,
         "gpu": True,
+        "preferred_field": args.preferred_field,
         "image_count": len(image_rows),
         "raw_dir": normalize_relpath(args.raw_dir),
         "mask_dir": normalize_relpath(args.mask_dir),
