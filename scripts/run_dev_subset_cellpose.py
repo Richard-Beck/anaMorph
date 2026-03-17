@@ -1,7 +1,6 @@
 import argparse
 import csv
 import os
-import shutil
 from datetime import datetime, timezone
 
 import numpy as np
@@ -24,6 +23,8 @@ def parse_args():
     parser.add_argument("--image-manifest", default="manifests/dev_subset_segmentation_images.csv")
     parser.add_argument("--run-label", default="")
     parser.add_argument("--preferred-field", default="bl")
+    parser.add_argument("--crop-height", type=int, default=1100)
+    parser.add_argument("--crop-width", type=int, default=1400)
     return parser.parse_args()
 
 
@@ -40,6 +41,14 @@ def normalize_relpath(path):
 def mask_output_path(mask_dir, source_name):
     stem, _ = os.path.splitext(source_name)
     return os.path.join(mask_dir, f"{stem}_mask.tif")
+
+
+def crop_top_left(image, crop_height, crop_width):
+    y_max = min(crop_height, image.shape[0])
+    x_max = min(crop_width, image.shape[1])
+    if image.ndim == 2:
+        return image[:y_max, :x_max]
+    return image[:y_max, :x_max, ...]
 
 
 def select_one_field_per_id(manifest, preferred_field):
@@ -62,7 +71,8 @@ def main():
     manifest = select_one_field_per_id(manifest, args.preferred_field)
 
     files = manifest["filepath"].tolist()
-    imgs = [imread(path) for path in files]
+    source_imgs = [imread(path) for path in files]
+    imgs = [crop_top_left(img, args.crop_height, args.crop_width) for img in source_imgs]
 
     model = models.CellposeModel(gpu=True, pretrained_model=args.pretrained_model)
     masks, flows, styles = model.eval(imgs)
@@ -76,15 +86,14 @@ def main():
     run_id = args.run_label or f"dev_subset_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
     image_rows = []
-    for row, image, mask in zip(manifest.to_dict(orient="records"), imgs, masks):
+    for row, source_image, image, mask in zip(manifest.to_dict(orient="records"), source_imgs, imgs, masks):
         source_path = row["filepath"]
         source_name = os.path.basename(source_path)
 
         raw_dest = os.path.join(args.raw_dir, source_name)
         mask_dest = mask_output_path(args.mask_dir, source_name)
 
-        if not os.path.exists(raw_dest):
-            shutil.copy2(source_path, raw_dest)
+        io.imsave(raw_dest, image)
 
         imwrite(mask_dest, np.asarray(mask, dtype=np.int32))
 
@@ -98,9 +107,12 @@ def main():
                 "source_filepath": normalize_relpath(source_path),
                 "raw_relpath": normalize_relpath(raw_dest),
                 "mask_relpath": normalize_relpath(mask_dest),
+                "source_image_shape": "x".join(str(x) for x in np.asarray(source_image).shape),
                 "image_shape": "x".join(str(x) for x in np.asarray(image).shape),
                 "mask_shape": "x".join(str(x) for x in np.asarray(mask).shape),
                 "object_count": int(np.max(mask)) if np.size(mask) else 0,
+                "crop_height": args.crop_height,
+                "crop_width": args.crop_width,
             }
         )
 
@@ -114,6 +126,9 @@ def main():
         "image_count": len(image_rows),
         "raw_dir": normalize_relpath(args.raw_dir),
         "mask_dir": normalize_relpath(args.mask_dir),
+        "crop_height": args.crop_height,
+        "crop_width": args.crop_width,
+        "crop_origin": "top_left",
     }
 
     with open(args.run_manifest, "w", newline="", encoding="utf-8") as handle:

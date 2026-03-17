@@ -10,6 +10,7 @@ This repository is for local development and testing of an image-analysis pipeli
 - The tile suffix is one of `bl`, `br`, `tl`, `tr`.
 - PNG overlays may also exist with the same stem plus `_overlay`.
 - The current external CellposeSAM model is on HPC at `/share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model`.
+- Current working assumption: a fixed top-left crop retaining `y < 1100` and `x < 1400` removes the scale bar across the dev subset, so tracked dev raws and downstream segmentations should be generated from that crop rather than the full frame.
 
 ## Recommended workflow
 
@@ -18,6 +19,7 @@ This repository is for local development and testing of an image-analysis pipeli
 3. Run [R/select_dev_subset.R](./R/select_dev_subset.R) on that manifest to choose a small, reproducible dev subset for local testing and Git sync.
 4. Run [scripts/run_dev_subset_cellpose.py](./scripts/run_dev_subset_cellpose.py) on HPC to copy the dev images into the repo and generate tracked segmentation masks as labeled TIFFs.
    By default it segments one image per `id` and prefers the `bl` field when multiple fields exist.
+   It also crops each source image to the top-left `1100 x 1400` region before saving the tracked dev raw image and running Cellpose, to exclude the scale bar artifact.
 5. Generate image/object summaries on demand with [scripts/summarize_dev_subset_masks.py](./scripts/summarize_dev_subset_masks.py) instead of committing large object tables.
 
 ## Example usage
