@@ -2,3 +2,5 @@ db_creds.txt
 data/dev_subset_image_summary.csv
 data/dev_subset_object_summary.csv
 data/dev_subset_overlays/
+data/all_images/
+logs/

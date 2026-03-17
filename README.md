@@ -84,6 +84,26 @@ python scripts/summarize_dev_subset_masks.py \
   --object-summary-csv data/dev_subset_object_summary.csv
 ```
 
+## Full HPC Run
+
+For full-dataset processing on HPC, use [scripts/run_all_raw_cellpose.py](./scripts/run_all_raw_cellpose.py). It scans the raw LTEE image directory directly, applies the same top-left crop (`y < 1100`, `x < 1400`), writes segmentation masks and per-image embedding CSVs under `data/all_images/`, and does not save cropped raw images.
+
+Example direct run:
+
+```bash
+python scripts/run_all_raw_cellpose.py \
+  --raw-data-dir /share/lab_crd/lab_crd/CLONEID/data/LTEEs \
+  --pretrained-model /share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model \
+  --mask-dir data/all_images/segmentation_masks \
+  --embedding-dir data/all_images/embeddings \
+  --run-manifest data/all_images/manifests/segmentation_runs.csv \
+  --image-manifest data/all_images/manifests/segmentation_images.csv \
+  --cellpose-batch-size 16 \
+  --embedding-batch-size 512
+```
+
+For cluster submission, use [scripts/submit_all_raw_cellpose.slurm](./scripts/submit_all_raw_cellpose.slurm).
+
 ## Design intent
 
 - Do not change the canonical HPC folder layout.
