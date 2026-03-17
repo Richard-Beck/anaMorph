@@ -25,6 +25,13 @@ def normalize_relpath(path):
     return path.replace("\\", "/")
 
 
+def load_mask(mask_path):
+    _, ext = os.path.splitext(mask_path)
+    if ext.lower() == ".npz":
+        return np.load(mask_path)["mask"]
+    return imread(mask_path)
+
+
 def main():
     args = parse_args()
     manifest = pd.read_csv(args.segmentation_manifest)
@@ -36,7 +43,7 @@ def main():
 
     for row in manifest.to_dict(orient="records"):
         image = imread(row["raw_relpath"])
-        mask = np.load(row["mask_relpath"])["mask"]
+        mask = load_mask(row["mask_relpath"])
 
         object_count = int(np.max(mask)) if np.size(mask) else 0
         foreground_pixels = int(np.sum(mask > 0))

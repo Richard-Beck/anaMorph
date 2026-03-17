@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from cellpose import io, models
 from cellpose.io import imread
+from tifffile import imwrite
 
 
 def parse_args():
@@ -34,6 +35,11 @@ def ensure_parent(path):
 
 def normalize_relpath(path):
     return path.replace("\\", "/")
+
+
+def mask_output_path(mask_dir, source_name):
+    stem, _ = os.path.splitext(source_name)
+    return os.path.join(mask_dir, f"{stem}_mask.tif")
 
 
 def select_one_field_per_id(manifest, preferred_field):
@@ -73,15 +79,14 @@ def main():
     for row, image, mask in zip(manifest.to_dict(orient="records"), imgs, masks):
         source_path = row["filepath"]
         source_name = os.path.basename(source_path)
-        stem, _ = os.path.splitext(source_name)
 
         raw_dest = os.path.join(args.raw_dir, source_name)
-        mask_dest = os.path.join(args.mask_dir, f"{stem}_mask.npz")
+        mask_dest = mask_output_path(args.mask_dir, source_name)
 
         if not os.path.exists(raw_dest):
             shutil.copy2(source_path, raw_dest)
 
-        np.savez_compressed(mask_dest, mask=np.asarray(mask, dtype=np.int32))
+        imwrite(mask_dest, np.asarray(mask, dtype=np.int32))
 
         image_rows.append(
             {

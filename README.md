@@ -16,7 +16,7 @@ This repository is for local development and testing of an image-analysis pipeli
 1. Export or refresh database metadata locally with [R/update_db.R](./R/update_db.R) when needed.
 2. Run [R/index_hpc_images.R](./R/index_hpc_images.R) against the HPC image directory to build an image manifest joined to passaging/media metadata.
 3. Run [R/select_dev_subset.R](./R/select_dev_subset.R) on that manifest to choose a small, reproducible dev subset for local testing and Git sync.
-4. Run [scripts/run_dev_subset_cellpose.py](./scripts/run_dev_subset_cellpose.py) on HPC to copy the dev images into the repo and generate tracked segmentation masks.
+4. Run [scripts/run_dev_subset_cellpose.py](./scripts/run_dev_subset_cellpose.py) on HPC to copy the dev images into the repo and generate tracked segmentation masks as labeled TIFFs.
    By default it segments one image per `id` and prefers the `bl` field when multiple fields exist.
 5. Generate image/object summaries on demand with [scripts/summarize_dev_subset_masks.py](./scripts/summarize_dev_subset_masks.py) instead of committing large object tables.
 
@@ -45,7 +45,7 @@ Rscript R/select_dev_subset.R \
   --ids_per_group 4
 ```
 
-The manifest CSVs, copied dev images, and saved dev masks are intended to be tracked in git and synchronized between local and HPC copies of the repo. Regenerable summary tables are not.
+The manifest CSVs, copied dev images, and saved TIFF masks are intended to be tracked in git and synchronized between local and HPC copies of the repo. Regenerable summary tables are not.
 
 Run CellposeSAM on the dev subset:
 
