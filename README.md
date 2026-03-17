@@ -20,6 +20,7 @@ This repository is for local development and testing of an image-analysis pipeli
 4. Run [scripts/run_dev_subset_cellpose.py](./scripts/run_dev_subset_cellpose.py) on HPC to copy the dev images into the repo and generate tracked segmentation masks as labeled TIFFs.
    By default it segments one image per `id` and prefers the `bl` field when multiple fields exist.
    It also crops each source image to the top-left `1100 x 1400` region before saving the tracked dev raw image and running Cellpose, to exclude the scale bar artifact.
+   For each segmented image, it exports one CSV in `dev_data/embeddings/` with one row per object containing the object label, bbox, area, `log1p(area)`, and a 512-d embedding from pretrained `ResNet18_Weights.DEFAULT`.
 5. Generate image/object summaries on demand with [scripts/summarize_dev_subset_masks.py](./scripts/summarize_dev_subset_masks.py) instead of committing large object tables.
 
 ## Example usage
@@ -57,6 +58,7 @@ python scripts/run_dev_subset_cellpose.py \
   --pretrained-model /share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model \
   --raw-dir dev_data/raw \
   --mask-dir dev_data/segmentation_masks \
+  --embedding-dir dev_data/embeddings \
   --run-manifest manifests/dev_subset_segmentation_runs.csv \
   --image-manifest manifests/dev_subset_segmentation_images.csv \
   --preferred-field bl
@@ -68,6 +70,7 @@ This uses only:
 - `gpu=True`
 - `pretrained_model=/share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model`
 - `model.eval(imgs)`
+- pretrained `ResNet18_Weights.DEFAULT` embeddings for each segmented object, saved per image as CSV
 
 Generate summaries later when needed:
 
