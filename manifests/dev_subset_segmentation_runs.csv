@@ -1,2 +1,2 @@
-run_id,timestamp_utc,manifest_csv,pretrained_model,gpu,preferred_field,image_count,raw_dir,mask_dir
-dev_subset_20260317T160300Z,2026-03-17T16:03:00Z,manifests/dev_subset_images.csv,/share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model,True,bl,16,dev_data/raw,dev_data/segmentation_masks
+run_id,timestamp_utc,manifest_csv,pretrained_model,gpu,preferred_field,image_count,raw_dir,mask_dir,crop_height,crop_width,crop_origin
+dev_subset_20260317T171929Z,2026-03-17T17:19:29Z,manifests/dev_subset_images.csv,/share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model,True,bl,16,dev_data/raw,dev_data/segmentation_masks,1100,1400,top_left
