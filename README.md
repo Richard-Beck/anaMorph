@@ -21,6 +21,7 @@ This repository is for local development and testing of an image-analysis pipeli
    By default it segments one image per `id` and prefers the `bl` field when multiple fields exist.
    It also crops each source image to the top-left `1100 x 1400` region before saving the tracked dev raw image and running Cellpose, to exclude the scale bar artifact.
    For each segmented image, it exports one CSV in `dev_data/embeddings/` with one row per object containing the object label, bbox, area, `log1p(area)`, and a 512-d embedding from pretrained `ResNet18_Weights.DEFAULT`.
+   The current wrapper streams work in small batches rather than loading the whole dev subset at once: Cellpose runs on image batches and embeddings run on per-image object batches, then outputs are written immediately.
 5. Generate image/object summaries on demand with [scripts/summarize_dev_subset_masks.py](./scripts/summarize_dev_subset_masks.py) instead of committing large object tables.
 
 ## Example usage
@@ -61,7 +62,9 @@ python scripts/run_dev_subset_cellpose.py \
   --embedding-dir dev_data/embeddings \
   --run-manifest manifests/dev_subset_segmentation_runs.csv \
   --image-manifest manifests/dev_subset_segmentation_images.csv \
-  --preferred-field bl
+  --preferred-field bl \
+  --cellpose-batch-size 8 \
+  --embedding-batch-size 256
 ```
 
 This uses only:
@@ -89,3 +92,10 @@ python scripts/summarize_dev_subset_masks.py \
 - Keep syncable manifests and subset definitions under tracked paths in the repo.
 - Treat segmentation as an external dependency until the model invocation and outputs are pulled into versioned pipeline code.
 - Keep large regenerable object summaries out of version control when possible.
+
+## Dev Notes
+
+- Current performance issue: adding per-object ResNet-18 embeddings makes `scripts/run_dev_subset_cellpose.py` unacceptably slow for routine iteration.
+- Observed behavior: GPU utilization remains low during the embedding stage, so the current implementation is not using hardware efficiently.
+- Pipeline constraint: doing Cellpose for all images first and deferring all embedding work until afterward is not viable at larger scale because the intermediate state will exceed available memory.
+- Working assumption for future optimization: the main bottleneck is likely per-object serial preprocessing/inference rather than Cellpose segmentation itself, so batching and a more GPU-efficient embedding path should be prioritized.

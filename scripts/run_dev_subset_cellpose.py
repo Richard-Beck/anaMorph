@@ -31,6 +31,8 @@ def parse_args():
     parser.add_argument("--preferred-field", default="bl")
     parser.add_argument("--crop-height", type=int, default=1100)
     parser.add_argument("--crop-width", type=int, default=1400)
+    parser.add_argument("--cellpose-batch-size", type=int, default=8)
+    parser.add_argument("--embedding-batch-size", type=int, default=256)
     return parser.parse_args()
 
 
@@ -42,6 +44,11 @@ def ensure_parent(path):
 
 def normalize_relpath(path):
     return path.replace("\\", "/")
+
+
+def iter_batches(items, batch_size):
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
 
 
 def mask_output_path(mask_dir, source_name):
@@ -90,7 +97,7 @@ def to_grayscale_uint8(image):
     return np.asarray(pil_image.convert("L"))
 
 
-def object_embedding_rows(image, mask, model, preprocess, device):
+def object_embedding_rows(image, mask, model, preprocess, device, embedding_batch_size):
     gray_image = to_grayscale_uint8(image)
     embedding_columns = [f"embedding_{idx:03d}" for idx in range(512)]
     base_columns = [
@@ -102,32 +109,89 @@ def object_embedding_rows(image, mask, model, preprocess, device):
         "bbox_max_row",
         "bbox_max_col",
     ]
-    rows = []
 
+    object_inputs = []
     for prop in regionprops(mask):
         min_row, min_col, max_row, max_col = prop.bbox
         gray_crop = gray_image[min_row:max_row, min_col:max_col].copy()
         gray_crop[~prop.image] = 0
+        object_inputs.append(
+            (
+                {
+                    "label": int(prop.label),
+                    "area_px": int(prop.area),
+                    "log1p_area": float(np.log1p(prop.area)),
+                    "bbox_min_row": int(min_row),
+                    "bbox_min_col": int(min_col),
+                    "bbox_max_row": int(max_row),
+                    "bbox_max_col": int(max_col),
+                },
+                gray_crop,
+            )
+        )
 
-        pil_crop = Image.fromarray(gray_crop, mode="L").convert("RGB")
-        x = preprocess(pil_crop).unsqueeze(0).to(device)
+    rows = []
+    for batch in iter_batches(object_inputs, embedding_batch_size):
+        batch_rows = [row for row, _ in batch]
+        batch_tensors = [
+            preprocess(Image.fromarray(gray_crop, mode="L").convert("RGB"))
+            for _, gray_crop in batch
+        ]
+        if not batch_tensors:
+            continue
 
+        x = torch.stack(batch_tensors, dim=0).to(device, non_blocking=True)
         with torch.inference_mode():
-            emb = model(x).squeeze(0).cpu().numpy()
+            batch_embeddings = model(x).cpu().numpy()
 
-        row = {
-            "label": int(prop.label),
-            "area_px": int(prop.area),
-            "log1p_area": float(np.log1p(prop.area)),
-            "bbox_min_row": int(min_row),
-            "bbox_min_col": int(min_col),
-            "bbox_max_row": int(max_row),
-            "bbox_max_col": int(max_col),
-        }
-        row.update({col: float(val) for col, val in zip(embedding_columns, emb)})
-        rows.append(row)
+        for row, emb in zip(batch_rows, batch_embeddings):
+            output_row = dict(row)
+            output_row.update({col: float(val) for col, val in zip(embedding_columns, emb)})
+            rows.append(output_row)
 
     return rows, base_columns + embedding_columns
+
+
+def process_segmented_image(row, source_image, image, mask, args, embedding_model, preprocess, embedding_device):
+    source_path = row["filepath"]
+    source_name = os.path.basename(source_path)
+
+    raw_dest = os.path.join(args.raw_dir, source_name)
+    mask_dest = mask_output_path(args.mask_dir, source_name)
+    embedding_dest = embedding_output_path(args.embedding_dir, source_name)
+
+    mask = np.asarray(mask, dtype=np.int32)
+
+    io.imsave(raw_dest, image)
+    imwrite(mask_dest, mask)
+
+    embedding_rows, embedding_columns = object_embedding_rows(
+        image=image,
+        mask=mask,
+        model=embedding_model,
+        preprocess=preprocess,
+        device=embedding_device,
+        embedding_batch_size=args.embedding_batch_size,
+    )
+    pd.DataFrame(embedding_rows, columns=embedding_columns).to_csv(embedding_dest, index=False)
+
+    return {
+        "id": row.get("id", ""),
+        "field": row.get("field", ""),
+        "filename": source_name,
+        "source_filepath": normalize_relpath(source_path),
+        "raw_relpath": normalize_relpath(raw_dest),
+        "mask_relpath": normalize_relpath(mask_dest),
+        "embedding_relpath": normalize_relpath(embedding_dest),
+        "source_image_shape": "x".join(str(x) for x in np.asarray(source_image).shape),
+        "image_shape": "x".join(str(x) for x in np.asarray(image).shape),
+        "mask_shape": "x".join(str(x) for x in mask.shape),
+        "object_count": int(np.max(mask)) if np.size(mask) else 0,
+        "embedding_count": len(embedding_rows),
+        "embedding_dim": 512,
+        "crop_height": args.crop_height,
+        "crop_width": args.crop_width,
+    }
 
 
 def main():
@@ -139,15 +203,11 @@ def main():
         raise SystemExit("No rows found in manifest.")
     manifest = select_one_field_per_id(manifest, args.preferred_field)
 
-    files = manifest["filepath"].tolist()
-    source_imgs = [imread(path) for path in files]
-    imgs = [crop_top_left(img, args.crop_height, args.crop_width) for img in source_imgs]
-
-    model = models.CellposeModel(gpu=True, pretrained_model=args.pretrained_model)
-    masks, flows, styles = model.eval(imgs)
+    cellpose_model = models.CellposeModel(gpu=True, pretrained_model=args.pretrained_model)
     embedding_model, preprocess = build_embedding_model()
     embedding_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     embedding_model = embedding_model.to(embedding_device)
+    embedding_model.eval()
 
     os.makedirs(args.raw_dir, exist_ok=True)
     os.makedirs(args.mask_dir, exist_ok=True)
@@ -159,47 +219,26 @@ def main():
     run_id = args.run_label or f"dev_subset_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
     image_rows = []
-    for row, source_image, image, mask in zip(manifest.to_dict(orient="records"), source_imgs, imgs, masks):
-        source_path = row["filepath"]
-        source_name = os.path.basename(source_path)
+    manifest_rows = manifest.to_dict(orient="records")
+    for manifest_batch in iter_batches(manifest_rows, args.cellpose_batch_size):
+        source_imgs = [imread(row["filepath"]) for row in manifest_batch]
+        imgs = [crop_top_left(img, args.crop_height, args.crop_width) for img in source_imgs]
+        masks, flows, styles = cellpose_model.eval(imgs)
 
-        raw_dest = os.path.join(args.raw_dir, source_name)
-        mask_dest = mask_output_path(args.mask_dir, source_name)
-        embedding_dest = embedding_output_path(args.embedding_dir, source_name)
-
-        io.imsave(raw_dest, image)
-
-        imwrite(mask_dest, np.asarray(mask, dtype=np.int32))
-        embedding_rows, embedding_columns = object_embedding_rows(
-            image=image,
-            mask=np.asarray(mask, dtype=np.int32),
-            model=embedding_model,
-            preprocess=preprocess,
-            device=embedding_device,
-        )
-        pd.DataFrame(embedding_rows, columns=embedding_columns).to_csv(embedding_dest, index=False)
-
-        image_rows.append(
-            {
-                "run_id": run_id,
-                "timestamp_utc": timestamp,
-                "id": row.get("id", ""),
-                "field": row.get("field", ""),
-                "filename": source_name,
-                "source_filepath": normalize_relpath(source_path),
-                "raw_relpath": normalize_relpath(raw_dest),
-                "mask_relpath": normalize_relpath(mask_dest),
-                "embedding_relpath": normalize_relpath(embedding_dest),
-                "source_image_shape": "x".join(str(x) for x in np.asarray(source_image).shape),
-                "image_shape": "x".join(str(x) for x in np.asarray(image).shape),
-                "mask_shape": "x".join(str(x) for x in np.asarray(mask).shape),
-                "object_count": int(np.max(mask)) if np.size(mask) else 0,
-                "embedding_count": len(embedding_rows),
-                "embedding_dim": 512,
-                "crop_height": args.crop_height,
-                "crop_width": args.crop_width,
-            }
-        )
+        for row, source_image, image, mask in zip(manifest_batch, source_imgs, imgs, masks):
+            image_row = process_segmented_image(
+                row=row,
+                source_image=source_image,
+                image=image,
+                mask=mask,
+                args=args,
+                embedding_model=embedding_model,
+                preprocess=preprocess,
+                embedding_device=embedding_device,
+            )
+            image_row["run_id"] = run_id
+            image_row["timestamp_utc"] = timestamp
+            image_rows.append(image_row)
 
     run_row = {
         "run_id": run_id,
@@ -215,6 +254,8 @@ def main():
         "embedding_model": "resnet18",
         "embedding_weights": "ResNet18_Weights.DEFAULT",
         "embedding_dim": 512,
+        "cellpose_batch_size": args.cellpose_batch_size,
+        "embedding_batch_size": args.embedding_batch_size,
         "crop_height": args.crop_height,
         "crop_width": args.crop_width,
         "crop_origin": "top_left",
@@ -225,8 +266,7 @@ def main():
         writer.writeheader()
         writer.writerow(run_row)
 
-    image_df = pd.DataFrame(image_rows)
-    image_df.to_csv(args.image_manifest, index=False)
+    pd.DataFrame(image_rows).to_csv(args.image_manifest, index=False)
 
     print(f"Run ID: {run_id}")
     print(f"Segmented images: {len(image_rows)}")
