@@ -1,3 +1,4 @@
 db_creds.txt
-dev_data/raw
+data/dev_subset_image_summary.csv
+data/dev_subset_object_summary.csv
 

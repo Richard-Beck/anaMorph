@@ -16,7 +16,8 @@ This repository is for local development and testing of an image-analysis pipeli
 1. Export or refresh database metadata locally with [R/update_db.R](./R/update_db.R) when needed.
 2. Run [R/index_hpc_images.R](./R/index_hpc_images.R) against the HPC image directory to build an image manifest joined to passaging/media metadata.
 3. Run [R/select_dev_subset.R](./R/select_dev_subset.R) on that manifest to choose a small, reproducible dev subset for local testing and Git sync.
-4. Use the dev subset for parser, QC, feature-extraction, and regression tests before running larger jobs on HPC.
+4. Run [scripts/run_dev_subset_cellpose.py](./scripts/run_dev_subset_cellpose.py) on HPC to copy the dev images into the repo and generate tracked segmentation masks.
+5. Generate image/object summaries on demand with [scripts/summarize_dev_subset_masks.py](./scripts/summarize_dev_subset_masks.py) instead of committing large object tables.
 
 ## Example usage
 
@@ -43,12 +44,41 @@ Rscript R/select_dev_subset.R \
   --ids_per_group 4
 ```
 
-The manifest CSVs and copy script are intended to be tracked in git and synchronized between local and HPC copies of the repo. Only the copied raw dev images should stay untracked.
+The manifest CSVs, copied dev images, and saved dev masks are intended to be tracked in git and synchronized between local and HPC copies of the repo. Regenerable summary tables are not.
+
+Run CellposeSAM on the dev subset:
+
+```bash
+python scripts/run_dev_subset_cellpose.py \
+  --manifest-csv manifests/dev_subset_images.csv \
+  --pretrained-model /share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model \
+  --raw-dir dev_data/raw \
+  --mask-dir dev_data/segmentation_masks \
+  --run-manifest manifests/dev_subset_segmentation_runs.csv \
+  --image-manifest manifests/dev_subset_segmentation_images.csv
+```
+
+This uses only:
+
+- the dev subset images
+- `gpu=True`
+- `pretrained_model=/share/lab_crd/lab_crd/CLONEID/cellpose_segmentation_models/current_model`
+- `model.eval(imgs)`
+
+Generate summaries later when needed:
+
+```bash
+python scripts/summarize_dev_subset_masks.py \
+  --segmentation-manifest manifests/dev_subset_segmentation_images.csv \
+  --image-summary-csv data/dev_subset_image_summary.csv \
+  --object-summary-csv data/dev_subset_object_summary.csv
+```
 
 ## Design intent
 
 - Do not change the canonical HPC folder layout.
 - Prefer manifests, summaries, and symlinked working views over file moves.
-- Keep only code, metadata, and a small dev subset in the local repo.
+- Keep only code, metadata, the small dev subset, and small segmentation artifacts in the local repo.
 - Keep syncable manifests and subset definitions under tracked paths in the repo.
 - Treat segmentation as an external dependency until the model invocation and outputs are pulled into versioned pipeline code.
+- Keep large regenerable object summaries out of version control when possible.
