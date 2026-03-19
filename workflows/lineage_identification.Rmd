@@ -1,0 +1,114 @@
+---
+title: "lineage identification"
+author: "Richard J Beck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "C:/Users/4473331/Documents/projects/021_ltee_models/anaMorph")
+```
+
+```{r}
+
+source("R/db_utils.R")
+
+x <- data.table::fread("core_data/passaging.csv")
+
+mani <- data.table::fread("manifests/image_manifest.csv")
+
+db_col <- collapse_db(x)
+
+
+got_im <- db_col$samples$samples%in%mani$id
+
+im_pass <- unique(db_col$samples$passage_id[got_im])
+db_col$passaging$imaged <- db_col$passaging$passage_id%in%im_pass
+
+```
+
+```{r}
+p <- unique(as.data.frame(db_col$passaging)[, c("passage_id","passage_from","imaged")], by="passage_id")
+p$passage_id <- as.character(p$passage_id)
+p$passage_from <- as.character(p$passage_from)
+
+im <- p$passage_id[p$imaged %in% TRUE]
+parent_of <- setNames(p$passage_from, p$passage_id)
+
+im_edges <- p[p$imaged %in% TRUE & !is.na(p$passage_from) & p$passage_from %in% im, ]
+tips <- setdiff(im, unique(im_edges$passage_from))
+
+lineages <- lapply(tips, function(tip){
+  lin <- tip
+  cur <- tip
+  repeat{
+    par <- parent_of[[cur]]
+    if(is.null(par) || is.na(par) || !(par %in% im)) break
+    lin <- c(lin, par)
+    cur <- par
+  }
+  lin
+})
+
+lin_dt <- do.call(rbind, lapply(seq_along(lineages), function(i){
+  data.frame(lineage_id=i, position=seq_along(lineages[[i]]), passage_id=lineages[[i]], stringsAsFactors=FALSE)
+}))
+
+comment_lut <- grepl("LTEE", x$comment)
+names(comment_lut) <- x$id
+lin_dt$ltee <- comment_lut[lin_dt$passage_id]
+
+lin_dt <- do.call(rbind, lapply(split(lin_dt, lin_dt$lineage_id), function(i){
+  if(sum(i$ltee, na.rm=TRUE) == 0) return(NULL)
+  i
+}))
+
+lin_list <- split(lin_dt$passage_id, lin_dt$lineage_id)
+
+keep <- rep(TRUE, length(lin_list))
+
+for(i in seq_along(lin_list)){
+  tail_i <- lin_list[[i]][-1]
+  if(length(tail_i) == 0) next
+  for(j in seq_along(lin_list)){
+    if(i == j) next
+    if(all(tail_i %in% lin_list[[j]])){
+      keep[i] <- FALSE
+      break
+    }
+  }
+}
+
+keep_ids <- names(lin_list)[keep]
+lin_dt <- lin_dt[lin_dt$lineage_id %in% keep_ids, ]
+
+sample_ids_by_passage <- split(
+  as.character(db_col$samples$samples),
+  as.character(db_col$samples$passage_id)
+)
+
+lineage_objects <- lapply(split(lin_dt, lin_dt$lineage_id), function(lineage_rows) {
+  lineage_rows <- lineage_rows[order(lineage_rows$position, decreasing = TRUE), , drop = FALSE]
+  passage_ids <- as.character(lineage_rows$passage_id)
+
+  passage_manifest <- setNames(lapply(passage_ids, function(passage_id) {
+    sample_ids <- sample_ids_by_passage[[passage_id]]
+    mani[mani$id %in% sample_ids, , drop = FALSE]
+  }), passage_ids)
+
+  list(
+    lineage_id = unique(as.character(lineage_rows$lineage_id)),
+    passage_ids = passage_ids,
+    passages = passage_manifest
+  )
+})
+
+names(lineage_objects) <- vapply(
+  lineage_objects,
+  function(lineage_obj) lineage_obj$lineage_id,
+  character(1)
+)
+
+```
+
+

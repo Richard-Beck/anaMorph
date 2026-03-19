@@ -84,6 +84,17 @@ python scripts/summarize_dev_subset_masks.py \
   --object-summary-csv data/dev_subset_object_summary.csv
 ```
 
+Reusable embedding clustering helpers live in [R/embedding_clustering_utils.R](./R/embedding_clustering_utils.R). Example:
+
+```r
+source("R/embedding_clustering_utils.R")
+
+image_names <- readr::read_csv("manifests/dev_subset_images.csv", show_col_types = FALSE)$filename
+embedding_tbl <- load_embedding_vectors(image_names)
+pca_result <- run_embedding_pca(embedding_tbl, n_pcs = 20)
+cluster_result <- cluster_reduced_embeddings(pca_result$scores, feature_cols = pca_result$score_cols)
+```
+
 ## Full HPC Run
 
 For full-dataset processing on HPC, use [scripts/run_all_raw_cellpose.py](./scripts/run_all_raw_cellpose.py). It scans the raw LTEE image directory directly, applies the same top-left crop (`y < 1100`, `x < 1400`), writes segmentation masks and per-image embedding CSVs under `data/all_images/`, and does not save cropped raw images.
@@ -103,6 +114,14 @@ python scripts/run_all_raw_cellpose.py \
 ```
 
 For cluster submission, use [scripts/submit_all_raw_cellpose.slurm](./scripts/submit_all_raw_cellpose.slurm).
+
+To save a compact per-image list of object sizes from the full-run embedding CSVs:
+
+```bash
+Rscript R/build_all_image_object_sizes.R \
+  --embedding_dir data/all_images/embeddings \
+  --out_rds data/all_images/object_sizes.rds
+```
 
 ## Design intent
 

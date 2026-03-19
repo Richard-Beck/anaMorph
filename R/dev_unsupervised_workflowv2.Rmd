@@ -1,0 +1,631 @@
+---
+title: "Dev Unsupervised Morphology Workflow"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  segmentation_manifest: "manifests/dev_subset_segmentation_images.csv"
+  metadata_manifest: "manifests/dev_subset_images.csv"
+  passaging_csv: "core_data/passaging.csv"
+  output_dir: "data/dev_unsupervised_analysis"
+  refresh_cache: true
+  umap_neighbors: 20
+  umap_min_dist: 0.15
+  max_pcs: 12
+  cluster_k: 8
+  representative_per_cluster: 8
+  crop_display_size: 64
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+## Overview
+
+This notebook builds a dev-scale object table by joining:
+
+- segmentation/image manifests
+- per-object embedding CSVs
+- per-image metadata from the dev subset manifest
+- compact classical morphology features derived directly from the label masks
+
+It then runs parallel unsupervised workflows on:
+
+- classical morphology features
+- ResNet-18 object embeddings
+
+The aim is to test whether visually obvious biological states and technical artifacts occupy distinct regions of feature space and can be quantified as cluster abundances.
+
+## Packages
+
+```{r packages}
+required_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "purrr",
+  "readr",
+  "stringr",
+  "tidyr",
+  "tibble",
+  "forcats",
+  "uwot",
+  "tiff",
+  "scales"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    sprintf(
+      "Install required packages before rendering: %s",
+      paste(missing_packages, collapse = ", ")
+    ),
+    call. = FALSE
+  )
+}
+
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(readr)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(forcats)
+library(scales)
+```
+
+## Helpers
+
+```{r helpers}
+resolve_project_root <- function() {
+  candidates <- c(
+    normalizePath(".", winslash = "/", mustWork = FALSE),
+    normalizePath("..", winslash = "/", mustWork = FALSE),
+    normalizePath("../..", winslash = "/", mustWork = FALSE)
+  )
+
+  for (candidate in unique(candidates)) {
+    if (file.exists(file.path(candidate, "README.md")) &&
+        dir.exists(file.path(candidate, "manifests")) &&
+        dir.exists(file.path(candidate, "dev_data"))) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate project root from current working directory.", call. = FALSE)
+}
+
+project_root <- resolve_project_root()
+
+project_path <- function(path) {
+  is_absolute <- grepl("^[A-Za-z]:[/\\\\]|^/", path)
+  out <- path
+  out[!is_absolute] <- file.path(project_root, path[!is_absolute])
+  out
+}
+
+output_dir <- project_path(params$output_dir)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+cache_path <- function(name) {
+  file.path(output_dir, name)
+}
+
+normalize_relpath <- function(path) {
+  gsub("\\\\", "/", path)
+}
+
+read_mask_tiff <- function(path) {
+  tiff::readTIFF(path, as.is = TRUE)
+}
+
+read_grayscale_image <- function(path) {
+  img <- tiff::readTIFF(path, native = FALSE)
+  dims <- dim(img)
+  if (is.null(dims) || length(dims) == 2) {
+    return(img)
+  }
+  if (length(dims) == 3) {
+    channels <- seq_len(min(3, dims[[3]]))
+    return(apply(img[, , channels, drop = FALSE], c(1, 2), mean))
+  }
+  stop(sprintf("Unsupported image dimensionality for %s", path), call. = FALSE)
+}
+
+parse_shape_hw <- function(shape_string) {
+  parts <- as.integer(str_split(shape_string, "x", simplify = TRUE))
+  c(height = parts[[1]], width = parts[[2]])
+}
+
+rescale_crop <- function(x) {
+  x <- as.matrix(x)
+  x[!is.finite(x)] <- 0
+  hi <- stats::quantile(x, probs = 0.995, na.rm = TRUE, names = FALSE)
+  lo <- min(x, na.rm = TRUE)
+  if (!is.finite(hi) || hi <= lo) {
+    hi <- max(x, na.rm = TRUE)
+  }
+  if (!is.finite(hi) || hi <= lo) {
+    return(matrix(0, nrow = nrow(x), ncol = ncol(x)))
+  }
+  out <- (x - lo) / (hi - lo)
+  out[out < 0] <- 0
+  out[out > 1] <- 1
+  out
+}
+
+resize_nn <- function(mat, out_height = 64, out_width = 64) {
+  y_idx <- round(seq(1, nrow(mat), length.out = out_height))
+  x_idx <- round(seq(1, ncol(mat), length.out = out_width))
+  mat[y_idx, x_idx, drop = FALSE]
+}
+
+crop_to_long_df <- function(mat, panel_id) {
+  display_mat <- resize_nn(rescale_crop(mat), params$crop_display_size, params$crop_display_size)
+  expand.grid(
+    x = seq_len(ncol(display_mat)),
+    y = seq_len(nrow(display_mat))
+  ) %>%
+    mutate(
+      intensity = as.vector(t(display_mat[nrow(display_mat):1, , drop = FALSE])),
+      panel_id = panel_id
+    )
+}
+
+build_representative_crop_df <- function(object_tbl, cluster_col, view_label, n_per_cluster) {
+  selected <- object_tbl %>%
+    group_by(.data[[cluster_col]]) %>%
+    arrange(cluster_distance, .by_group = TRUE) %>%
+    slice_head(n = n_per_cluster) %>%
+    ungroup() %>%
+    mutate(
+      panel_id = paste0(
+        "C", .data[[cluster_col]], " | ", filename, " | L", label
+      )
+    )
+
+  crop_dfs <- selected %>%
+    group_split(filename) %>%
+    purrr::map(function(file_group) {
+      image <- read_grayscale_image(file_group$raw_relpath[[1]])
+      mask <- read_mask_tiff(file_group$mask_relpath[[1]])
+
+      purrr::pmap(
+        list(
+          file_group$label,
+          file_group$bbox_min_row,
+          file_group$bbox_min_col,
+          file_group$bbox_max_row,
+          file_group$bbox_max_col,
+          file_group$panel_id
+        ),
+        function(label, min_row, min_col, max_row, max_col, panel_id) {
+          row_idx <- seq.int(min_row + 1L, max_row)
+          col_idx <- seq.int(min_col + 1L, max_col)
+          crop <- image[row_idx, col_idx, drop = FALSE]
+          crop_mask <- mask[row_idx, col_idx, drop = FALSE] == label
+          crop[!crop_mask] <- 0
+          crop_to_long_df(crop, panel_id)
+        }
+      ) %>%
+        bind_rows()
+    }) %>%
+    bind_rows()
+
+  crop_dfs %>%
+    mutate(
+      cluster = str_extract(panel_id, "^C[0-9]+"),
+      view = view_label
+    )
+}
+
+run_unsupervised_view <- function(object_tbl, feature_cols, view_name) {
+  feature_mat <- object_tbl %>%
+    select(all_of(feature_cols)) %>%
+    as.matrix()
+
+  keep_rows <- complete.cases(feature_mat)
+  filtered_tbl <- object_tbl[keep_rows, , drop = FALSE]
+  feature_mat <- feature_mat[keep_rows, , drop = FALSE]
+
+  scaled_mat <- scale(feature_mat)
+  pca <- prcomp(scaled_mat, center = FALSE, scale. = FALSE)
+  n_pcs <- min(params$max_pcs, ncol(pca$x))
+  pc_scores <- pca$x[, seq_len(n_pcs), drop = FALSE]
+  n_neighbors <- min(params$umap_neighbors, max(2, nrow(pc_scores) - 1))
+  n_clusters <- min(params$cluster_k, nrow(pc_scores))
+
+  set.seed(1)
+  umap_coords <- uwot::umap(
+    pc_scores,
+    n_neighbors = n_neighbors,
+    min_dist = params$umap_min_dist,
+    metric = "euclidean",
+    verbose = FALSE,
+    ret_model = FALSE
+  )
+
+  set.seed(1)
+  km <- stats::kmeans(pc_scores, centers = n_clusters, nstart = 20)
+  centers <- km$centers[km$cluster, , drop = FALSE]
+  cluster_distance <- sqrt(rowSums((pc_scores - centers) ^ 2))
+
+  filtered_tbl %>%
+    mutate(
+      view = view_name,
+      cluster = factor(km$cluster),
+      cluster_distance = cluster_distance,
+      PC1 = pca$x[, 1],
+      PC2 = if (ncol(pca$x) >= 2) pca$x[, 2] else 0,
+      UMAP1 = umap_coords[, 1],
+      UMAP2 = umap_coords[, 2]
+    )
+}
+```
+
+## Load Metadata And Embeddings
+
+```{r load-data}
+seg_manifest <- readr::read_csv(project_path(params$segmentation_manifest), show_col_types = FALSE) %>%
+  mutate(
+    raw_relpath = project_path(normalize_relpath(raw_relpath)),
+    mask_relpath = project_path(normalize_relpath(mask_relpath)),
+    embedding_relpath = project_path(normalize_relpath(embedding_relpath))
+  )
+
+dev_metadata <- readr::read_csv(project_path(params$metadata_manifest), show_col_types = FALSE) %>%
+  select(
+    filename, id, field, cellLine, event, passage,
+    passage_num, date, growthType, media, group_key
+  ) %>%
+  distinct()
+
+passaging_metadata <- readr::read_csv(project_path(params$passaging_csv), show_col_types = FALSE) %>%
+  select(id, event) %>%
+  distinct()
+
+seg_manifest <- seg_manifest %>%
+  left_join(passaging_metadata, by = "id") %>%
+  filter(is.na(event) | event != "seeding")
+
+embedding_cache <- cache_path("embedding_table.rds")
+
+if (file.exists(embedding_cache) && !isTRUE(params$refresh_cache)) {
+  embedding_tbl <- readRDS(embedding_cache)
+} else {
+  embedding_tbl <- purrr::map_dfr(seq_len(nrow(seg_manifest)), function(i) {
+    seg_row <- seg_manifest[i, ]
+    readr::read_csv(seg_row$embedding_relpath, show_col_types = FALSE) %>%
+      mutate(
+        id = seg_row$id,
+        field = seg_row$field,
+        filename = seg_row$filename,
+        raw_relpath = seg_row$raw_relpath,
+        mask_relpath = seg_row$mask_relpath,
+        run_id = seg_row$run_id,
+        timestamp_utc = seg_row$timestamp_utc
+      )
+  })
+  saveRDS(embedding_tbl, embedding_cache)
+}
+
+embedding_tbl %>%
+  summarise(
+    images = n_distinct(filename),
+    objects = n(),
+    mean_objects_per_image = mean(table(filename))
+  )
+```
+
+## Derive Classical Morphology Features
+
+```{r morphology-features}
+derive_mask_features <- function(seg_row, embedding_rows) {
+  mask <- read_mask_tiff(seg_row$mask_relpath)
+  image <- read_grayscale_image(seg_row$raw_relpath)
+  mask_height <- nrow(mask)
+  mask_width <- ncol(mask)
+
+  purrr::pmap_dfr(
+    list(
+      embedding_rows$label,
+      embedding_rows$bbox_min_row,
+      embedding_rows$bbox_min_col,
+      embedding_rows$bbox_max_row,
+      embedding_rows$bbox_max_col,
+      embedding_rows$area_px
+    ),
+    function(label, min_row, min_col, max_row, max_col, area_px) {
+      row_idx <- seq.int(min_row + 1L, max_row)
+      col_idx <- seq.int(min_col + 1L, max_col)
+      object_mask <- mask[row_idx, col_idx, drop = FALSE] == label
+      object_image <- image[row_idx, col_idx, drop = FALSE]
+      object_image[!object_mask] <- 0
+
+      bbox_height <- max_row - min_row
+      bbox_width <- max_col - min_col
+      bbox_area <- bbox_height * bbox_width
+      object_pixels <- which(object_mask, arr.ind = TRUE)
+      centroid_row <- mean(object_pixels[, 1]) + min_row
+      centroid_col <- mean(object_pixels[, 2]) + min_col
+
+      tibble(
+        label = label,
+        bbox_height = bbox_height,
+        bbox_width = bbox_width,
+        bbox_area = bbox_area,
+        bbox_aspect = bbox_height / pmax(bbox_width, 1),
+        bbox_fill_fraction = area_px / pmax(bbox_area, 1),
+        edge_touching = min_row == 0L | min_col == 0L | max_row >= mask_height | max_col >= mask_width,
+        centroid_row = centroid_row,
+        centroid_col = centroid_col,
+        centroid_row_scaled = centroid_row / mask_height,
+        centroid_col_scaled = centroid_col / mask_width,
+        intensity_mean = mean(object_image[object_mask]),
+        intensity_sd = stats::sd(object_image[object_mask]),
+        intensity_q90 = stats::quantile(object_image[object_mask], probs = 0.9, names = FALSE),
+        image_height = mask_height,
+        image_width = mask_width
+      )
+    }
+  )
+}
+
+mask_feature_cache <- cache_path("mask_feature_table.rds")
+object_cache <- cache_path("dev_object_table.rds")
+
+if (file.exists(mask_feature_cache) && !isTRUE(params$refresh_cache)) {
+  mask_feature_tbl <- readRDS(mask_feature_cache)
+} else {
+  mask_feature_tbl <- purrr::map_dfr(seq_len(nrow(seg_manifest)), function(i) {
+    seg_row <- seg_manifest[i, ]
+    embedding_rows <- embedding_tbl %>%
+      filter(filename == seg_row$filename)
+    derive_mask_features(seg_row, embedding_rows) %>%
+      mutate(filename = seg_row$filename)
+  })
+  saveRDS(mask_feature_tbl, mask_feature_cache)
+}
+
+if (file.exists(object_cache) && !isTRUE(params$refresh_cache)) {
+  object_tbl <- readRDS(object_cache)
+} else {
+  object_tbl <- embedding_tbl %>%
+    left_join(mask_feature_tbl, by = c("filename", "label")) %>%
+    left_join(dev_metadata, by = c("filename", "id", "field")) %>%
+    mutate(
+      cellLine = coalesce(cellLine, "unknown"),
+      edge_touching = as.logical(edge_touching)
+    )
+  saveRDS(object_tbl, object_cache)
+}
+
+readr::write_csv(object_tbl, file.path(output_dir, "dev_object_table.csv"))
+
+object_tbl %>%
+  summarise(
+    objects = n(),
+    images = n_distinct(filename),
+    cell_lines = n_distinct(cellLine)
+  )
+```
+
+## Feature Views
+
+```{r feature-views}
+morphology_features <- c(
+  "area_px",
+  "log1p_area",
+  "bbox_height",
+  "bbox_width",
+  "bbox_aspect",
+  "bbox_fill_fraction",
+  "centroid_row_scaled",
+  "centroid_col_scaled",
+  "intensity_mean",
+  "intensity_sd",
+  "intensity_q90"
+)
+
+embedding_features <- names(object_tbl)[stringr::str_detect(names(object_tbl), "^embedding_")]
+
+view_cache <- cache_path("all_unsupervised_views.rds")
+
+if (file.exists(view_cache) && !isTRUE(params$refresh_cache)) {
+  all_views <- readRDS(view_cache)
+} else {
+  morphology_view <- run_unsupervised_view(object_tbl, morphology_features, "Morphology")
+  embedding_view <- run_unsupervised_view(object_tbl, embedding_features, "Embedding")
+  all_views <- bind_rows(morphology_view, embedding_view)
+  saveRDS(all_views, view_cache)
+}
+```
+
+## UMAP: Morphology
+
+```{r umap-morphology}
+ggplot(filter(all_views, view == "Morphology"), aes(UMAP1, UMAP2, color = cluster)) +
+  geom_point(alpha = 0.7, size = 1.2) +
+  coord_equal() +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = "Morphology UMAP", color = "Cluster") +
+  theme_minimal()
+```
+
+## UMAP: Embeddings
+
+```{r umap-embedding}
+ggplot(filter(all_views, view == "Embedding"), aes(UMAP1, UMAP2, color = cluster)) +
+  geom_point(alpha = 0.7, size = 1.2) +
+  coord_equal() +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = "Embedding UMAP", color = "Cluster") +
+  theme_minimal()
+```
+
+## Known Labels Overlaid On Embedding Space
+
+```{r known-labels}
+plot_embedding_label <- function(label_col, title) {
+  ggplot(filter(all_views, view == "Embedding"), aes(UMAP1, UMAP2, color = .data[[label_col]])) +
+    geom_point(alpha = 0.7, size = 1.1) +
+    coord_equal() +
+    labs(title = title, color = label_col) +
+    theme_minimal()
+}
+
+plot_embedding_label("cellLine", "Embedding UMAP Colored By Cell Line")
+plot_embedding_label("filename", "Embedding UMAP Colored By Image Filename")
+```
+
+## Cluster Summaries
+
+```{r cluster-summary}
+cluster_summary <- all_views %>%
+  group_by(view, cluster) %>%
+  summarise(
+    objects = n(),
+    images = n_distinct(filename),
+    edge_touching_fraction = mean(edge_touching),
+    mean_log1p_area = mean(log1p_area, na.rm = TRUE),
+    mean_fill_fraction = mean(bbox_fill_fraction, na.rm = TRUE),
+    mean_intensity = mean(intensity_mean, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(view, desc(objects))
+
+readr::write_csv(cluster_summary, file.path(output_dir, "cluster_summary.csv"))
+knitr::kable(cluster_summary)
+```
+
+## Cluster Composition By Cell Line
+
+```{r cluster-composition-cellline}
+composition_by_cellline <- all_views %>%
+  count(view, cellLine, cluster) %>%
+  group_by(view, cellLine) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup()
+
+ggplot(composition_by_cellline, aes(cellLine, frac, fill = cluster)) +
+  geom_col(position = "stack") +
+  facet_wrap(~ view, ncol = 1) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Cluster Composition By Cell Line",
+    x = "Cell Line",
+    y = "Fraction Of Objects"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Cluster Composition By Image
+
+```{r cluster-composition-image}
+composition_by_image <- all_views %>%
+  count(view, filename, cluster) %>%
+  group_by(view, filename) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup()
+
+ggplot(composition_by_image, aes(filename, frac, fill = cluster)) +
+  geom_col(position = "stack") +
+  facet_wrap(~ view, ncol = 1) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Cluster Composition By Image",
+    x = "Image Filename",
+    y = "Fraction Of Objects"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+## Representative Crops: Embedding Clusters
+
+```{r representative-crops-embedding, fig.height=10, fig.width=12}
+embedding_crop_df <- build_representative_crop_df(
+  object_tbl = filter(all_views, view == "Embedding"),
+  cluster_col = "cluster",
+  view_label = "Embedding",
+  n_per_cluster = params$representative_per_cluster
+)
+
+ggplot(embedding_crop_df, aes(x, y, fill = intensity)) +
+  geom_raster() +
+  scale_fill_gradient(low = "black", high = "white") +
+  coord_equal() +
+  facet_wrap(~ panel_id, ncol = 4) +
+  labs(title = "Representative Object Crops From Embedding Clusters", fill = "Intensity") +
+  theme_void() +
+  theme(
+    strip.text = element_text(size = 7),
+    legend.position = "none"
+  )
+```
+
+## Representative Crops: Morphology Clusters
+
+```{r representative-crops-morphology, fig.height=10, fig.width=12}
+morphology_crop_df <- build_representative_crop_df(
+  object_tbl = filter(all_views, view == "Morphology"),
+  cluster_col = "cluster",
+  view_label = "Morphology",
+  n_per_cluster = params$representative_per_cluster
+)
+
+ggplot(morphology_crop_df, aes(x, y, fill = intensity)) +
+  geom_raster() +
+  scale_fill_gradient(low = "black", high = "white") +
+  coord_equal() +
+  facet_wrap(~ panel_id, ncol = 4) +
+  labs(title = "Representative Object Crops From Morphology Clusters", fill = "Intensity") +
+  theme_void() +
+  theme(
+    strip.text = element_text(size = 7),
+    legend.position = "none"
+  )
+```
+
+## Candidate Artifact Clusters
+
+```{r artifact-candidates}
+artifact_candidates <- all_views %>%
+  group_by(view, cluster) %>%
+  summarise(
+    objects = n(),
+    edge_touching_fraction = mean(edge_touching),
+    mean_fill_fraction = mean(bbox_fill_fraction, na.rm = TRUE),
+    mean_log1p_area = mean(log1p_area, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(view, desc(edge_touching_fraction), mean_fill_fraction)
+
+knitr::kable(artifact_candidates)
+```
+
+Clusters with high `edge_touching_fraction`, very low `bbox_fill_fraction`, or extreme size statistics are good first candidates for technical artifacts or malformed segmentations. Compare those rows to the representative crop panels above.
+
+## Session Outputs
+
+```{r outputs}
+readr::write_csv(all_views, file.path(output_dir, "dev_unsupervised_object_table.csv"))
+
+tibble(
+  output = c(
+    file.path(output_dir, "dev_object_table.csv"),
+    file.path(output_dir, "dev_unsupervised_object_table.csv"),
+    file.path(output_dir, "cluster_summary.csv")
+  )
+)
+```
