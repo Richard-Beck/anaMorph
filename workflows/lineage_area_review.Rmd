@@ -1,0 +1,412 @@
+---
+title: "Lineage Area Review"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  lineage_id: "7"
+  analysis_dir: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5
+)
+```
+
+## Overview
+
+This notebook reviews the saved single-lineage area analysis produced by `R/analyze_single_lineage_area.R`.
+
+It is organized around three questions:
+
+1. What did the small-object nuisance model remove or downweight?
+2. Did growth-state adjustment absorb obvious dependence on time since passage start and confluence?
+3. Which passages differ in center, spread, or upper-tail burden after adjustment?
+
+## Packages
+
+```{r packages}
+required_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "readr",
+  "tibble",
+  "tidyr",
+  "stringr",
+  "scales"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    sprintf(
+      "Install required packages before rendering: %s",
+      paste(missing_packages, collapse = ", ")
+    ),
+    call. = FALSE
+  )
+}
+
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(tidyr)
+library(stringr)
+library(scales)
+```
+
+## Helpers
+
+```{r helpers}
+resolve_project_root <- function() {
+  candidates <- c(
+    normalizePath(".", winslash = "/", mustWork = FALSE),
+    normalizePath("..", winslash = "/", mustWork = FALSE),
+    normalizePath("../..", winslash = "/", mustWork = FALSE)
+  )
+
+  for (candidate in unique(candidates)) {
+    if (file.exists(file.path(candidate, "README.md")) &&
+        dir.exists(file.path(candidate, "workflows"))) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate project root from current working directory.", call. = FALSE)
+}
+
+project_root <- resolve_project_root()
+
+project_path <- function(path) {
+  is_absolute <- grepl("^[A-Za-z]:[/\\\\]|^/", path)
+  out <- path
+  out[!is_absolute] <- file.path(project_root, path[!is_absolute])
+  out
+}
+
+analysis_dir_param <- params$analysis_dir
+if (is.null(analysis_dir_param) || !nzchar(analysis_dir_param)) {
+  analysis_dir_param <- file.path("data/lineage_area", paste0("lineage_", params$lineage_id))
+}
+
+analysis_dir <- project_path(analysis_dir_param)
+analysis_rds <- file.path(analysis_dir, "lineage_area_analysis.rds")
+
+if (!file.exists(analysis_rds)) {
+  stop(sprintf("Analysis RDS not found: %s", analysis_rds), call. = FALSE)
+}
+
+safe_quantile <- function(x, prob) {
+  if (!length(x) || all(is.na(x))) return(NA_real_)
+  as.numeric(stats::quantile(x, probs = prob, na.rm = TRUE, names = FALSE))
+}
+
+fmt_num <- function(x, digits = 2) {
+  formatC(x, format = "f", digits = digits, big.mark = ",")
+}
+```
+
+## Load Analysis
+
+```{r load-analysis}
+analysis_obj <- readRDS(analysis_rds)
+
+cell_tbl <- tibble::as_tibble(analysis_obj$cells) %>%
+  mutate(
+    passage_position = as.integer(passage_position),
+    p_small = as.numeric(p_small),
+    p_real = as.numeric(p_real),
+    z = as.numeric(z),
+    log_area = as.numeric(log_area),
+    time_since_passage_start_hours = as.numeric(time_since_passage_start_hours),
+    log_confluence = as.numeric(log_confluence)
+  )
+
+image_tbl <- tibble::as_tibble(analysis_obj$image_summary) %>%
+  mutate(passage_position = as.integer(passage_position))
+
+passage_tbl <- tibble::as_tibble(analysis_obj$passage_summary) %>%
+  mutate(
+    passage_position = as.integer(passage_position),
+    first_image_time = as.POSIXct(first_image_time, origin = "1970-01-01", tz = "UTC")
+  ) %>%
+  arrange(passage_position)
+
+mixture_fit <- analysis_obj$mixture_fit
+lineage_id <- analysis_obj$lineage_id
+```
+
+## Snapshot
+
+```{r snapshot}
+overview_tbl <- tibble(
+  lineage_id = lineage_id,
+  n_passages = length(unique(cell_tbl$passage_id)),
+  n_images = length(unique(cell_tbl$image_key)),
+  n_objects = nrow(cell_tbl),
+  weighted_real_objects = sum(cell_tbl$p_real, na.rm = TRUE),
+  mean_nuisance_fraction = mean(cell_tbl$p_small, na.rm = TRUE)
+)
+
+knitr::kable(overview_tbl, digits = 2)
+```
+
+Interpretation:
+
+- `mean_nuisance_fraction` is the average posterior probability that an object belongs to the low-area nuisance component.
+- `weighted_real_objects` is the effective object count after downweighting small objects.
+
+## Passage Summary Table
+
+```{r passage-summary-table}
+passage_display <- passage_tbl %>%
+  transmute(
+    passage_position,
+    passage_id,
+    n_objects,
+    effective_n = round(effective_n, 1),
+    nuisance_fraction = round(nuisance_fraction, 3),
+    median_z = round(median_z, 3),
+    iqr_z = round(iqr_z, 3),
+    q95_z = round(q95_z, 3),
+    q99_z = round(q99_z, 3),
+    frac_z_gt_2 = round(frac_z_gt_2, 3),
+    frac_z_gt_3 = round(frac_z_gt_3, 3),
+    mean_time_since_passage_start_hours = round(mean_time_since_passage_start_hours, 2),
+    mean_log_confluence = round(mean_log_confluence, 2)
+  )
+
+knitr::kable(passage_display)
+```
+
+## 1. Small-Object Nuisance Model
+
+```{r nuisance-model-plot}
+mix_x <- seq(min(cell_tbl$log_area, na.rm = TRUE), max(cell_tbl$log_area, na.rm = TRUE), length.out = 400)
+mix_df <- tibble(
+  log_area = mix_x,
+  component_1 = mixture_fit$pi[[1]] * dnorm(mix_x, mixture_fit$mu[[1]], mixture_fit$sigma[[1]]),
+  component_2 = mixture_fit$pi[[2]] * dnorm(mix_x, mixture_fit$mu[[2]], mixture_fit$sigma[[2]])
+) %>%
+  tidyr::pivot_longer(cols = starts_with("component"), names_to = "component", values_to = "density")
+
+ggplot(cell_tbl, aes(x = log_area)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 80, fill = "#cfd8dc", color = "white") +
+  geom_line(data = mix_df, aes(y = density, color = component), linewidth = 1.1) +
+  geom_vline(xintercept = mixture_fit$mu, linetype = "dashed", color = c("#d55e00", "#0072b2")) +
+  scale_color_manual(values = c(component_1 = "#d55e00", component_2 = "#0072b2")) +
+  labs(
+    title = paste("Lineage", lineage_id, ": mixture on log(area)"),
+    subtitle = "The lower-mean component is treated as the small-object nuisance population",
+    x = "log(area_px)",
+    y = "Density",
+    color = "Mixture component"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r nuisance-by-passage}
+ggplot(passage_tbl, aes(x = passage_position, y = nuisance_fraction)) +
+  geom_line(color = "#b23a48", linewidth = 0.9) +
+  geom_point(color = "#b23a48", size = 2) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = passage_tbl$passage_position) +
+  labs(
+    title = "Estimated nuisance burden by passage",
+    x = "Passage position within lineage",
+    y = "Mean nuisance posterior"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+Interpretation:
+
+- If the nuisance fraction spikes in only a few passages, that often points to segmentation drift or image-quality issues.
+- If the nuisance fraction rises gradually along the lineage, it may reflect a genuine shift in the low-end size population or worsening object fragmentation.
+
+## 2. Growth-State Adjustment Diagnostics
+
+```{r residual-vs-time}
+set.seed(1)
+diag_tbl <- cell_tbl %>%
+  filter(is.finite(z), is.finite(time_since_passage_start_hours), is.finite(log_confluence)) %>%
+  sample_n(size = min(n(), 30000))
+
+ggplot(diag_tbl, aes(x = time_since_passage_start_hours, y = z)) +
+  geom_point(alpha = 0.08, size = 0.5, color = "#1f4e5f") +
+  geom_smooth(se = FALSE, color = "#d1495b", linewidth = 1) +
+  labs(
+    title = "Residual z-score vs time since passage start",
+    subtitle = "After adjustment, the smooth should be close to flat",
+    x = "Time since passage start (hours)",
+    y = "Adjusted residual z"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r residual-vs-confluence}
+ggplot(diag_tbl, aes(x = log_confluence, y = z)) +
+  geom_point(alpha = 0.08, size = 0.5, color = "#1f4e5f") +
+  geom_smooth(se = FALSE, color = "#d1495b", linewidth = 1) +
+  labs(
+    title = "Residual z-score vs confluence",
+    subtitle = "Large remaining trends mean the baseline model did not fully absorb growth-state effects",
+    x = "log1p(confluence area)",
+    y = "Adjusted residual z"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r image-level-diagnostics}
+image_diag_tbl <- image_tbl %>%
+  arrange(passage_position)
+
+ggplot(image_diag_tbl, aes(x = mean_time_since_passage_start_hours, y = median_z, color = factor(passage_position))) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Image-level median residual by time within passage",
+    subtitle = "Useful for spotting whether a passage summary is driven by one late/early image",
+    x = "Mean time since passage start (hours)",
+    y = "Image median z",
+    color = "Passage"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 3. Passage-Level Shifts After Adjustment
+
+```{r center-and-spread}
+center_spread_tbl <- passage_tbl %>%
+  select(passage_position, median_z, iqr_z) %>%
+  pivot_longer(cols = c(median_z, iqr_z), names_to = "metric", values_to = "value")
+
+ggplot(center_spread_tbl, aes(x = passage_position, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  scale_x_continuous(breaks = passage_tbl$passage_position) +
+  scale_color_manual(values = c(median_z = "#33658a", iqr_z = "#86bbd8")) +
+  labs(
+    title = "Passage-level center and spread",
+    x = "Passage position within lineage",
+    y = "Residual summary",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r upper-tail}
+tail_tbl <- passage_tbl %>%
+  select(passage_position, q95_z, q99_z, frac_z_gt_2, frac_z_gt_3) %>%
+  pivot_longer(cols = -passage_position, names_to = "metric", values_to = "value")
+
+ggplot(tail_tbl, aes(x = passage_position, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(breaks = passage_tbl$passage_position) +
+  labs(
+    title = "Upper-tail burden across passages",
+    subtitle = "Look for passage-specific enrichment of unusually large cells",
+    x = "Passage position within lineage",
+    y = "Tail summary",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 4. Distribution Shape Across Passages
+
+```{r passage-quantile-profile}
+quantile_probs <- c(0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
+
+quantile_tbl <- cell_tbl %>%
+  filter(is.finite(z), p_real >= 0.5) %>%
+  group_by(passage_position, passage_id) %>%
+  summarise(
+    q05 = safe_quantile(z, 0.05),
+    q25 = safe_quantile(z, 0.25),
+    q50 = safe_quantile(z, 0.50),
+    q75 = safe_quantile(z, 0.75),
+    q95 = safe_quantile(z, 0.95),
+    q99 = safe_quantile(z, 0.99),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = starts_with("q"),
+    names_to = "quantile",
+    values_to = "z_value"
+  )
+
+ggplot(quantile_tbl, aes(x = passage_position, y = z_value, color = quantile)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  scale_x_continuous(breaks = passage_tbl$passage_position) +
+  labs(
+    title = "Residual quantile profiles by passage",
+    subtitle = "This makes it easier to see whether changes are central, broad, or confined to the upper tail",
+    x = "Passage position within lineage",
+    y = "Residual z",
+    color = "Quantile"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r sampled-density-by-passage}
+set.seed(2)
+density_tbl <- cell_tbl %>%
+  filter(is.finite(z), p_real >= 0.5) %>%
+  group_by(passage_position, passage_id) %>%
+  sample_n(size = min(n(), 4000)) %>%
+  ungroup() %>%
+  mutate(passage_label = paste0("P", passage_position, ": ", passage_id))
+
+ggplot(density_tbl, aes(x = z)) +
+  geom_density(fill = "#7fb069", alpha = 0.6, color = "#2f5233") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~ passage_label, scales = "free_y") +
+  labs(
+    title = "Residual distribution by passage",
+    subtitle = "Panels use objects with p_real >= 0.5 to suppress the nuisance population visually",
+    x = "Residual z",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## Reading The Outputs
+
+The plots above support a compact interpretation:
+
+- `median_z` tracks whether the typical cell is larger or smaller than expected for its growth state.
+- `iqr_z` tracks dispersion after adjustment.
+- `q95_z`, `q99_z`, `frac_z_gt_2`, and `frac_z_gt_3` track rare large-cell burden.
+- `nuisance_fraction` tracks the low-area junk or fragmented-object burden.
+
+Practical reading guide:
+
+1. Start with the nuisance plots. If a passage has a large nuisance fraction, treat downstream shifts cautiously.
+2. Check the residual-vs-time and residual-vs-confluence diagnostics. If the smooths are not close to flat, the baseline model still has growth-state confounding.
+3. Use the center/spread plot to detect broad distributional drift.
+4. Use the upper-tail and quantile-profile plots to detect rare large-cell subpopulations.
+5. Use the faceted densities to confirm whether a passage shift is global or tail-specific.
+
+## Render
+
+```{r render-help, eval=FALSE}
+rmarkdown::render(
+  "workflows/lineage_area_review.Rmd",
+  params = list(
+    lineage_id = "7",
+    analysis_dir = "data/lineage_area/lineage_7"
+  )
+)
+```
