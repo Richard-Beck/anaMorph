@@ -343,11 +343,11 @@ ggplot(heatmap_tbl, aes(x = passage_position, y = lineage_id, fill = median_z)) 
 ## Choose A Focus Lineage
 
 ```{r choose-focus-lineage}
-best_transition <- transition_tbl %>% slice(1)
+best_transition_tbl <- transition_tbl %>% slice(1)
 
 focus_lineage_id <- params$lineage_id
 if (is.null(focus_lineage_id) || !nzchar(focus_lineage_id)) {
-  focus_lineage_id <- best_transition$lineage_id[[1]]
+  focus_lineage_id <- best_transition_tbl$lineage_id[[1]]
 }
 
 focus_analysis_dir <- params$analysis_dir
@@ -380,19 +380,23 @@ focus_passage_tbl <- focus_obj$passage_summary %>%
   ) %>%
   arrange(passage_position)
 
-focus_transition <- transition_tbl %>%
+focus_transition_tbl <- transition_tbl %>%
   filter(lineage_id == focus_lineage_id) %>%
   slice_max(order_by = transition_score, n = 1, with_ties = FALSE)
+
+if (!inherits(focus_transition_tbl, "data.frame") || nrow(focus_transition_tbl) == 0) {
+  stop(sprintf("No ranked transition found for lineage %s", focus_lineage_id), call. = FALSE)
+}
 
 focus_summary_tbl <- tibble(
   focus_lineage_id = focus_lineage_id,
   focus_transition = paste0(
-    "P", focus_transition$passage_position,
-    " (", focus_transition$passage_id, ") -> P",
-    focus_transition$next_position,
-    " (", focus_transition$next_passage_id, ")"
+    "P", focus_transition_tbl$passage_position[[1]],
+    " (", focus_transition_tbl$passage_id[[1]], ") -> P",
+    focus_transition_tbl$next_position[[1]],
+    " (", focus_transition_tbl$next_passage_id[[1]], ")"
   ),
-  focus_transition_score = focus_transition$transition_score
+  focus_transition_score = focus_transition_tbl$transition_score[[1]]
 )
 
 knitr::kable(focus_summary_tbl, digits = 3)
@@ -427,7 +431,7 @@ focus_long_tbl <- focus_passage_tbl %>%
 ggplot(focus_long_tbl, aes(x = passage_position, y = value, color = metric)) +
   geom_line(linewidth = 1) +
   geom_point(size = 2) +
-  geom_vline(xintercept = focus_transition$passage_position + 0.5, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = focus_transition_tbl$passage_position[[1]] + 0.5, linetype = "dashed", color = "gray50") +
   labs(
     title = paste("Lineage", focus_lineage_id, ": passage-level adjusted distribution summaries"),
     subtitle = "Dashed line marks the highest-ranked transition within this lineage",
@@ -439,7 +443,7 @@ ggplot(focus_long_tbl, aes(x = passage_position, y = value, color = metric)) +
 ```
 
 ```{r focus-density-panels}
-target_passages <- c(focus_transition$passage_id[[1]], focus_transition$next_passage_id[[1]])
+target_passages <- c(focus_transition_tbl$passage_id[[1]], focus_transition_tbl$next_passage_id[[1]])
 
 focus_density_tbl <- focus_cell_tbl %>%
   filter(passage_id %in% target_passages, is.finite(z), p_real >= 0.5) %>%
@@ -503,7 +507,7 @@ manifest_tbl <- readr::read_csv(manifest_path, show_col_types = FALSE) %>%
   filter(artifact_type == "raw_image") %>%
   distinct(filename, filepath, .keep_all = TRUE)
 
-direction_positive <- focus_transition$delta_q99_z[[1]] >= 0
+direction_positive <- focus_transition_tbl$delta_q99_z[[1]] >= 0
 
 before_tbl <- transition_image_tbl %>%
   filter(transition_side == "before")
