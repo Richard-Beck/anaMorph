@@ -135,6 +135,17 @@ Rscript R/analyze_single_lineage_area.R \
 
 This writes one lineage-specific folder with per-cell residuals plus image- and passage-level summaries after a small-object mixture adjustment and growth-state normalization.
 
+To submit the single-lineage analysis across all saved lineages on SLURM as an array job:
+
+```bash
+sbatch scripts/submit_lineage_area_analysis.slurm \
+  core_data/lineages.Rds \
+  data/all_images/object_sizes.rds \
+  data/lineage_area
+```
+
+The wrapper resolves one `lineage_id` per array task from `core_data/lineages.Rds` and runs `R/analyze_single_lineage_area.R`. The current default array range is `1-88`; if the lineage count changes, update the `#SBATCH --array=` line or override it at submission time with `sbatch --array=1-N ...`.
+
 ## Design intent
 
 - Do not change the canonical HPC folder layout.
