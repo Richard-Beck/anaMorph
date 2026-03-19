@@ -355,7 +355,6 @@ passage_summary <- summarize_group(
 passage_summary <- merge(
   passage_summary,
   unique(cell_dt[, .(
-    passage_id,
     first_image_time = if (all(is.na(image_time))) as.POSIXct(NA, tz = "UTC") else min(image_time, na.rm = TRUE),
     mean_confluence_um2 = mean(confluence_um2, na.rm = TRUE)
   ), by = passage_id]),
