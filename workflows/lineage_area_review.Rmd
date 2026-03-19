@@ -5,8 +5,12 @@ output:
     toc: true
     toc_float: true
 params:
-  lineage_id: "7"
+  lineage_id: null
   analysis_dir: null
+  all_results_dir: "data/lineage_area"
+  manifest_csv: "manifests/image_manifest.csv"
+  show_images: true
+  max_images: 10
 ---
 
 ```{r setup, include=FALSE}
@@ -21,13 +25,13 @@ knitr::opts_chunk$set(
 
 ## Overview
 
-This notebook reviews the saved single-lineage area analysis produced by `R/analyze_single_lineage_area.R`.
+This notebook reviews the saved area analyses across all lineages and highlights the most promising passage-to-passage shifts.
 
-It is organized around three questions:
+The intended use is:
 
-1. What did the small-object nuisance model remove or downweight?
-2. Did growth-state adjustment absorb obvious dependence on time since passage start and confluence?
-3. Which passages differ in center, spread, or upper-tail burden after adjustment?
+1. Rank lineages by how strongly their adjusted area distributions change across passages.
+2. Pick one promising lineage and transition.
+3. Inspect the raw image panel around that transition to check whether the statistical signal looks real.
 
 ## Packages
 
@@ -35,6 +39,7 @@ It is organized around three questions:
 required_packages <- c(
   "dplyr",
   "ggplot2",
+  "purrr",
   "readr",
   "tibble",
   "tidyr",
@@ -55,6 +60,7 @@ if (length(missing_packages) > 0) {
 
 library(dplyr)
 library(ggplot2)
+library(purrr)
 library(readr)
 library(tibble)
 library(tidyr)
@@ -91,16 +97,27 @@ project_path <- function(path) {
   out
 }
 
-analysis_dir_param <- params$analysis_dir
-if (is.null(analysis_dir_param) || !nzchar(analysis_dir_param)) {
-  analysis_dir_param <- file.path("data/lineage_area", paste0("lineage_", params$lineage_id))
+analysis_dir_from_id <- function(lineage_id) {
+  file.path(project_path(params$all_results_dir), paste0("lineage_", lineage_id))
 }
 
-analysis_dir <- project_path(analysis_dir_param)
-analysis_rds <- file.path(analysis_dir, "lineage_area_analysis.rds")
-
-if (!file.exists(analysis_rds)) {
-  stop(sprintf("Analysis RDS not found: %s", analysis_rds), call. = FALSE)
+parse_datetime_safe <- function(x) {
+  if (inherits(x, "POSIXct")) return(x)
+  x <- as.character(x)
+  out <- as.POSIXct(rep(NA_character_, length(x)), tz = "UTC")
+  formats <- c(
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%d %H:%M:%OS",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y %H:%M:%S"
+  )
+  for (fmt in formats) {
+    missing <- is.na(out) & !is.na(x) & nzchar(x)
+    if (!any(missing)) next
+    out[missing] <- as.POSIXct(x[missing], format = fmt, tz = "UTC")
+  }
+  out
 }
 
 safe_quantile <- function(x, prob) {
@@ -108,18 +125,242 @@ safe_quantile <- function(x, prob) {
   as.numeric(stats::quantile(x, probs = prob, na.rm = TRUE, names = FALSE))
 }
 
-fmt_num <- function(x, digits = 2) {
-  formatC(x, format = "f", digits = digits, big.mark = ",")
+rescale_01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!all(is.finite(rng)) || diff(rng) <= 0) return(rep(0, length(x)))
+  (x - rng[[1]]) / diff(rng)
+}
+
+normalize_for_display <- function(img) {
+  img <- as.array(img)
+  if (length(dim(img)) == 3) {
+    img <- apply(img[, , seq_len(min(3, dim(img)[3])), drop = FALSE], c(1, 2), mean)
+  }
+  q <- stats::quantile(img, probs = c(0.01, 0.99), na.rm = TRUE, names = FALSE)
+  img <- pmin(pmax(img, q[[1]]), q[[2]])
+  img <- img - min(img, na.rm = TRUE)
+  mx <- max(img, na.rm = TRUE)
+  if (is.finite(mx) && mx > 0) {
+    img <- img / mx
+  }
+  img
+}
+
+plot_grayscale_matrix <- function(img, main = "") {
+  raster_img <- as.raster(img[nrow(img):1, ], max = 1)
+  plot.new()
+  usr <- par("usr")
+  rasterImage(raster_img, usr[1], usr[3], usr[2], usr[4], interpolate = FALSE)
+  title(main = main, cex.main = 0.8)
+}
+
+read_analysis_bundle <- function(path) {
+  obj <- readRDS(path)
+  list(
+    lineage_id = as.character(obj$lineage_id),
+    cells = tibble::as_tibble(obj$cells),
+    image_summary = tibble::as_tibble(obj$image_summary),
+    passage_summary = tibble::as_tibble(obj$passage_summary)
+  )
 }
 ```
 
-## Load Analysis
+## Discover Analysis Outputs
 
-```{r load-analysis}
-analysis_obj <- readRDS(analysis_rds)
+```{r discover-results}
+all_results_dir <- project_path(params$all_results_dir)
+analysis_paths <- list.files(
+  all_results_dir,
+  pattern = "lineage_area_analysis\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
 
-cell_tbl <- tibble::as_tibble(analysis_obj$cells) %>%
+if (!length(analysis_paths)) {
+  stop(sprintf("No lineage analysis outputs found under %s", all_results_dir), call. = FALSE)
+}
+
+analysis_index <- tibble(
+  analysis_rds = analysis_paths,
+  analysis_dir = dirname(analysis_paths),
+  lineage_id = sub("^lineage_", "", basename(dirname(analysis_paths)))
+)
+
+knitr::kable(
+  tibble(
+    n_lineages_found = nrow(analysis_index),
+    results_dir = all_results_dir
+  )
+)
+```
+
+## Load Summary Metrics Across All Lineages
+
+```{r load-all-summaries}
+summary_bundle <- purrr::map(analysis_index$analysis_rds, read_analysis_bundle)
+
+all_passage_tbl <- purrr::map2_dfr(summary_bundle, analysis_index$analysis_dir, function(bundle, analysis_dir) {
+  bundle$passage_summary %>%
+    mutate(
+      lineage_id = bundle$lineage_id,
+      analysis_dir = analysis_dir,
+      passage_position = as.integer(passage_position),
+      first_image_time = parse_datetime_safe(first_image_time)
+    )
+})
+
+all_image_tbl <- purrr::map2_dfr(summary_bundle, analysis_index$analysis_dir, function(bundle, analysis_dir) {
+  bundle$image_summary %>%
+    mutate(
+      lineage_id = bundle$lineage_id,
+      analysis_dir = analysis_dir,
+      passage_position = as.integer(passage_position)
+    )
+})
+```
+
+## Rank The Most Promising Transitions
+
+```{r transition-ranking}
+transition_tbl <- all_passage_tbl %>%
+  arrange(lineage_id, passage_position) %>%
+  group_by(lineage_id) %>%
   mutate(
+    next_passage_id = lead(passage_id),
+    next_position = lead(passage_position),
+    delta_median_z = lead(median_z) - median_z,
+    delta_iqr_z = lead(iqr_z) - iqr_z,
+    delta_q95_z = lead(q95_z) - q95_z,
+    delta_q99_z = lead(q99_z) - q99_z,
+    delta_frac_z_gt_2 = lead(frac_z_gt_2) - frac_z_gt_2,
+    delta_frac_z_gt_3 = lead(frac_z_gt_3) - frac_z_gt_3
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(next_passage_id)) %>%
+  mutate(
+    transition_score =
+      abs(delta_median_z) +
+      0.75 * abs(delta_iqr_z) +
+      abs(delta_q95_z) +
+      1.25 * abs(delta_q99_z) +
+      4 * abs(delta_frac_z_gt_2) +
+      6 * abs(delta_frac_z_gt_3)
+  ) %>%
+  arrange(desc(transition_score))
+
+top_transition_tbl <- transition_tbl %>%
+  select(
+    lineage_id,
+    passage_position,
+    passage_id,
+    next_position,
+    next_passage_id,
+    transition_score,
+    delta_median_z,
+    delta_iqr_z,
+    delta_q95_z,
+    delta_q99_z,
+    delta_frac_z_gt_2,
+    delta_frac_z_gt_3
+  ) %>%
+  slice_head(n = 15)
+
+knitr::kable(top_transition_tbl, digits = 3)
+```
+
+Interpretation:
+
+- Large `delta_median_z` means the center of the adjusted size distribution moved.
+- Large `delta_iqr_z` means the spread changed.
+- Large `delta_q95_z`, `delta_q99_z`, or `delta_frac_z_gt_3` means the upper tail changed, which is often the most relevant signal for rare large-cell states.
+- `transition_score` is just a ranking heuristic to find candidate transitions worth visual review.
+
+## Cross-Lineage Summary Plots
+
+```{r lineage-ranking-plot}
+lineage_rank_tbl <- transition_tbl %>%
+  group_by(lineage_id) %>%
+  summarise(
+    best_transition_score = max(transition_score, na.rm = TRUE),
+    max_abs_delta_median_z = max(abs(delta_median_z), na.rm = TRUE),
+    max_abs_delta_q99_z = max(abs(delta_q99_z), na.rm = TRUE),
+    max_abs_delta_frac_z_gt_3 = max(abs(delta_frac_z_gt_3), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(best_transition_score))
+
+ggplot(
+  lineage_rank_tbl,
+  aes(
+    x = max_abs_delta_median_z,
+    y = max_abs_delta_q99_z,
+    size = max_abs_delta_frac_z_gt_3,
+    color = best_transition_score
+  )
+) +
+  geom_point(alpha = 0.8) +
+  geom_text(
+    data = slice_head(lineage_rank_tbl, n = 10),
+    aes(label = lineage_id),
+    nudge_y = 0.03,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_color_gradient(low = "#8ecae6", high = "#d00000") +
+  labs(
+    title = "Which lineages show the strongest passage-to-passage shifts?",
+    subtitle = "Upper-right lineages change both in center and upper tail",
+    x = "Max absolute change in passage median z",
+    y = "Max absolute change in passage q99 z",
+    size = "Max absolute\nchange in frac(z > 3)",
+    color = "Best transition\nscore"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r top-lineage-heatmap}
+top_lineages <- lineage_rank_tbl %>%
+  slice_head(n = 20) %>%
+  pull(lineage_id)
+
+heatmap_tbl <- all_passage_tbl %>%
+  filter(lineage_id %in% top_lineages) %>%
+  mutate(lineage_id = factor(lineage_id, levels = rev(top_lineages)))
+
+ggplot(heatmap_tbl, aes(x = passage_position, y = lineage_id, fill = median_z)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0) +
+  labs(
+    title = "Passage-level median residual across top-ranked lineages",
+    subtitle = "Red passages are larger-than-expected after growth-state adjustment",
+    x = "Passage position",
+    y = "Lineage",
+    fill = "Median z"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Choose A Focus Lineage
+
+```{r choose-focus-lineage}
+best_transition <- transition_tbl %>% slice(1)
+
+focus_lineage_id <- params$lineage_id
+if (is.null(focus_lineage_id) || !nzchar(focus_lineage_id)) {
+  focus_lineage_id <- best_transition$lineage_id[[1]]
+}
+
+focus_analysis_dir <- params$analysis_dir
+if (is.null(focus_analysis_dir) || !nzchar(focus_analysis_dir)) {
+  focus_analysis_dir <- analysis_dir_from_id(focus_lineage_id)
+}
+focus_analysis_rds <- file.path(project_path(focus_analysis_dir), "lineage_area_analysis.rds")
+
+focus_obj <- read_analysis_bundle(focus_analysis_rds)
+
+focus_cell_tbl <- focus_obj$cells %>%
+  mutate(
+    lineage_id = as.character(lineage_id),
     passage_position = as.integer(passage_position),
     p_small = as.numeric(p_small),
     p_real = as.numeric(p_real),
@@ -129,44 +370,38 @@ cell_tbl <- tibble::as_tibble(analysis_obj$cells) %>%
     log_confluence = as.numeric(log_confluence)
   )
 
-image_tbl <- tibble::as_tibble(analysis_obj$image_summary) %>%
+focus_image_tbl <- focus_obj$image_summary %>%
   mutate(passage_position = as.integer(passage_position))
 
-passage_tbl <- tibble::as_tibble(analysis_obj$passage_summary) %>%
+focus_passage_tbl <- focus_obj$passage_summary %>%
   mutate(
     passage_position = as.integer(passage_position),
-    first_image_time = as.POSIXct(first_image_time, origin = "1970-01-01", tz = "UTC")
+    first_image_time = parse_datetime_safe(first_image_time)
   ) %>%
   arrange(passage_position)
 
-mixture_fit <- analysis_obj$mixture_fit
-lineage_id <- analysis_obj$lineage_id
-```
+focus_transition <- transition_tbl %>%
+  filter(lineage_id == focus_lineage_id) %>%
+  slice_max(order_by = transition_score, n = 1, with_ties = FALSE)
 
-## Snapshot
-
-```{r snapshot}
-overview_tbl <- tibble(
-  lineage_id = lineage_id,
-  n_passages = length(unique(cell_tbl$passage_id)),
-  n_images = length(unique(cell_tbl$image_key)),
-  n_objects = nrow(cell_tbl),
-  weighted_real_objects = sum(cell_tbl$p_real, na.rm = TRUE),
-  mean_nuisance_fraction = mean(cell_tbl$p_small, na.rm = TRUE)
+focus_summary_tbl <- tibble(
+  focus_lineage_id = focus_lineage_id,
+  focus_transition = paste0(
+    "P", focus_transition$passage_position,
+    " (", focus_transition$passage_id, ") -> P",
+    focus_transition$next_position,
+    " (", focus_transition$next_passage_id, ")"
+  ),
+  focus_transition_score = focus_transition$transition_score
 )
 
-knitr::kable(overview_tbl, digits = 2)
+knitr::kable(focus_summary_tbl, digits = 3)
 ```
 
-Interpretation:
+## Focus Lineage: Distributional Review
 
-- `mean_nuisance_fraction` is the average posterior probability that an object belongs to the low-area nuisance component.
-- `weighted_real_objects` is the effective object count after downweighting small objects.
-
-## Passage Summary Table
-
-```{r passage-summary-table}
-passage_display <- passage_tbl %>%
+```{r focus-passage-summary}
+focus_display_tbl <- focus_passage_tbl %>%
   transmute(
     passage_position,
     passage_id,
@@ -178,226 +413,155 @@ passage_display <- passage_tbl %>%
     q95_z = round(q95_z, 3),
     q99_z = round(q99_z, 3),
     frac_z_gt_2 = round(frac_z_gt_2, 3),
-    frac_z_gt_3 = round(frac_z_gt_3, 3),
-    mean_time_since_passage_start_hours = round(mean_time_since_passage_start_hours, 2),
-    mean_log_confluence = round(mean_log_confluence, 2)
+    frac_z_gt_3 = round(frac_z_gt_3, 3)
   )
 
-knitr::kable(passage_display)
+knitr::kable(focus_display_tbl)
 ```
 
-## 1. Small-Object Nuisance Model
+```{r focus-center-and-tail}
+focus_long_tbl <- focus_passage_tbl %>%
+  select(passage_position, median_z, iqr_z, q95_z, q99_z, frac_z_gt_3) %>%
+  pivot_longer(cols = -passage_position, names_to = "metric", values_to = "value")
 
-```{r nuisance-model-plot}
-mix_x <- seq(min(cell_tbl$log_area, na.rm = TRUE), max(cell_tbl$log_area, na.rm = TRUE), length.out = 400)
-mix_df <- tibble(
-  log_area = mix_x,
-  component_1 = mixture_fit$pi[[1]] * dnorm(mix_x, mixture_fit$mu[[1]], mixture_fit$sigma[[1]]),
-  component_2 = mixture_fit$pi[[2]] * dnorm(mix_x, mixture_fit$mu[[2]], mixture_fit$sigma[[2]])
-) %>%
-  tidyr::pivot_longer(cols = starts_with("component"), names_to = "component", values_to = "density")
-
-ggplot(cell_tbl, aes(x = log_area)) +
-  geom_histogram(aes(y = after_stat(density)), bins = 80, fill = "#cfd8dc", color = "white") +
-  geom_line(data = mix_df, aes(y = density, color = component), linewidth = 1.1) +
-  geom_vline(xintercept = mixture_fit$mu, linetype = "dashed", color = c("#d55e00", "#0072b2")) +
-  scale_color_manual(values = c(component_1 = "#d55e00", component_2 = "#0072b2")) +
+ggplot(focus_long_tbl, aes(x = passage_position, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = focus_transition$passage_position + 0.5, linetype = "dashed", color = "gray50") +
   labs(
-    title = paste("Lineage", lineage_id, ": mixture on log(area)"),
-    subtitle = "The lower-mean component is treated as the small-object nuisance population",
-    x = "log(area_px)",
+    title = paste("Lineage", focus_lineage_id, ": passage-level adjusted distribution summaries"),
+    subtitle = "Dashed line marks the highest-ranked transition within this lineage",
+    x = "Passage position",
+    y = "Summary value",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r focus-density-panels}
+target_passages <- c(focus_transition$passage_id[[1]], focus_transition$next_passage_id[[1]])
+
+focus_density_tbl <- focus_cell_tbl %>%
+  filter(passage_id %in% target_passages, is.finite(z), p_real >= 0.5) %>%
+  group_by(passage_id) %>%
+  sample_n(size = min(n(), 5000)) %>%
+  ungroup() %>%
+  mutate(
+    passage_label = paste0("P", passage_position, ": ", passage_id)
+  )
+
+ggplot(focus_density_tbl, aes(x = z, fill = passage_label)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = paste("Focus transition in lineage", focus_lineage_id),
+    subtitle = "Before/after residual distributions for the highest-ranked transition",
+    x = "Residual z",
     y = "Density",
-    color = "Mixture component"
+    fill = "Passage"
   ) +
   theme_minimal(base_size = 12)
 ```
 
-```{r nuisance-by-passage}
-ggplot(passage_tbl, aes(x = passage_position, y = nuisance_fraction)) +
-  geom_line(color = "#b23a48", linewidth = 0.9) +
-  geom_point(color = "#b23a48", size = 2) +
-  scale_y_continuous(labels = percent_format(accuracy = 1)) +
-  scale_x_continuous(breaks = passage_tbl$passage_position) +
-  labs(
-    title = "Estimated nuisance burden by passage",
-    x = "Passage position within lineage",
-    y = "Mean nuisance posterior"
-  ) +
-  theme_minimal(base_size = 12)
+```{r focus-image-transition}
+transition_image_tbl <- focus_image_tbl %>%
+  filter(passage_id %in% target_passages) %>%
+  mutate(
+    transition_side = ifelse(passage_id == target_passages[[1]], "before", "after"),
+    image_rank_score = abs(median_z) + abs(q99_z) + 4 * frac_z_gt_3
+  ) %>%
+  arrange(desc(image_rank_score))
+
+knitr::kable(
+  transition_image_tbl %>%
+    select(
+      transition_side,
+      passage_position,
+      passage_id,
+      image_id,
+      filename,
+      n_objects,
+      median_z,
+      iqr_z,
+      q99_z,
+      frac_z_gt_3
+    ) %>%
+    slice_head(n = min(n(), params$max_images)),
+  digits = 3
+)
+```
+
+## Candidate Image Panel
+
+```{r candidate-images, eval=params$show_images}
+if (!requireNamespace("EBImage", quietly = TRUE)) {
+  stop("Install EBImage to render the raw image panel.", call. = FALSE)
+}
+
+manifest_path <- project_path(params$manifest_csv)
+manifest_tbl <- readr::read_csv(manifest_path, show_col_types = FALSE) %>%
+  filter(artifact_type == "raw_image") %>%
+  distinct(filename, filepath, .keep_all = TRUE)
+
+direction_positive <- focus_transition$delta_q99_z[[1]] >= 0
+
+before_tbl <- transition_image_tbl %>%
+  filter(transition_side == "before")
+after_tbl <- transition_image_tbl %>%
+  filter(transition_side == "after")
+
+if (direction_positive) {
+  before_tbl <- before_tbl %>% arrange(median_z)
+  after_tbl <- after_tbl %>% arrange(desc(median_z))
+} else {
+  before_tbl <- before_tbl %>% arrange(desc(median_z))
+  after_tbl <- after_tbl %>% arrange(median_z)
+}
+
+half_n <- max(1, floor(params$max_images / 2))
+candidate_tbl <- bind_rows(
+  before_tbl %>% slice_head(n = half_n),
+  after_tbl %>% slice_head(n = params$max_images - half_n)
+) %>%
+  left_join(manifest_tbl %>% select(filename, filepath), by = "filename") %>%
+  filter(!is.na(filepath))
+
+if (!nrow(candidate_tbl)) {
+  stop("No candidate images could be matched to file paths in the manifest.", call. = FALSE)
+}
+
+op <- par(mfrow = c(ceiling(nrow(candidate_tbl) / 2), 2), mar = c(1, 1, 3, 1))
+on.exit(par(op), add = TRUE)
+
+for (i in seq_len(nrow(candidate_tbl))) {
+  row <- candidate_tbl[i, ]
+  img <- EBImage::readImage(row$filepath[[1]])
+  img <- normalize_for_display(img)
+  plot_grayscale_matrix(
+    img,
+    main = paste0(
+      row$transition_side[[1]], " | P", row$passage_position[[1]], "\n",
+      "med=", formatC(row$median_z[[1]], digits = 2, format = "f"),
+      " q99=", formatC(row$q99_z[[1]], digits = 2, format = "f")
+    )
+  )
+}
 ```
 
 Interpretation:
 
-- If the nuisance fraction spikes in only a few passages, that often points to segmentation drift or image-quality issues.
-- If the nuisance fraction rises gradually along the lineage, it may reflect a genuine shift in the low-end size population or worsening object fragmentation.
+- The image panel is meant as a reality check, not a formal validation step.
+- If the selected before/after images show obvious segmentation artifacts, focus on nuisance fraction and image-level instability before trusting the transition.
+- If the images show a coherent morphology shift that aligns with the residual summaries, that lineage becomes a strong candidate for deeper follow-up.
 
-## 2. Growth-State Adjustment Diagnostics
+## Reading This Notebook
 
-```{r residual-vs-time}
-set.seed(1)
-diag_tbl <- cell_tbl %>%
-  filter(is.finite(z), is.finite(time_since_passage_start_hours), is.finite(log_confluence)) %>%
-  sample_n(size = min(n(), 30000))
+Use the output in this order:
 
-ggplot(diag_tbl, aes(x = time_since_passage_start_hours, y = z)) +
-  geom_point(alpha = 0.08, size = 0.5, color = "#1f4e5f") +
-  geom_smooth(se = FALSE, color = "#d1495b", linewidth = 1) +
-  labs(
-    title = "Residual z-score vs time since passage start",
-    subtitle = "After adjustment, the smooth should be close to flat",
-    x = "Time since passage start (hours)",
-    y = "Adjusted residual z"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-```{r residual-vs-confluence}
-ggplot(diag_tbl, aes(x = log_confluence, y = z)) +
-  geom_point(alpha = 0.08, size = 0.5, color = "#1f4e5f") +
-  geom_smooth(se = FALSE, color = "#d1495b", linewidth = 1) +
-  labs(
-    title = "Residual z-score vs confluence",
-    subtitle = "Large remaining trends mean the baseline model did not fully absorb growth-state effects",
-    x = "log1p(confluence area)",
-    y = "Adjusted residual z"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-```{r image-level-diagnostics}
-image_diag_tbl <- image_tbl %>%
-  arrange(passage_position)
-
-ggplot(image_diag_tbl, aes(x = mean_time_since_passage_start_hours, y = median_z, color = factor(passage_position))) +
-  geom_point(size = 2, alpha = 0.8) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
-  labs(
-    title = "Image-level median residual by time within passage",
-    subtitle = "Useful for spotting whether a passage summary is driven by one late/early image",
-    x = "Mean time since passage start (hours)",
-    y = "Image median z",
-    color = "Passage"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-## 3. Passage-Level Shifts After Adjustment
-
-```{r center-and-spread}
-center_spread_tbl <- passage_tbl %>%
-  select(passage_position, median_z, iqr_z) %>%
-  pivot_longer(cols = c(median_z, iqr_z), names_to = "metric", values_to = "value")
-
-ggplot(center_spread_tbl, aes(x = passage_position, y = value, color = metric)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 2) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
-  scale_x_continuous(breaks = passage_tbl$passage_position) +
-  scale_color_manual(values = c(median_z = "#33658a", iqr_z = "#86bbd8")) +
-  labs(
-    title = "Passage-level center and spread",
-    x = "Passage position within lineage",
-    y = "Residual summary",
-    color = "Metric"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-```{r upper-tail}
-tail_tbl <- passage_tbl %>%
-  select(passage_position, q95_z, q99_z, frac_z_gt_2, frac_z_gt_3) %>%
-  pivot_longer(cols = -passage_position, names_to = "metric", values_to = "value")
-
-ggplot(tail_tbl, aes(x = passage_position, y = value, color = metric)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 1.8) +
-  scale_x_continuous(breaks = passage_tbl$passage_position) +
-  labs(
-    title = "Upper-tail burden across passages",
-    subtitle = "Look for passage-specific enrichment of unusually large cells",
-    x = "Passage position within lineage",
-    y = "Tail summary",
-    color = "Metric"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-## 4. Distribution Shape Across Passages
-
-```{r passage-quantile-profile}
-quantile_probs <- c(0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
-
-quantile_tbl <- cell_tbl %>%
-  filter(is.finite(z), p_real >= 0.5) %>%
-  group_by(passage_position, passage_id) %>%
-  summarise(
-    q05 = safe_quantile(z, 0.05),
-    q25 = safe_quantile(z, 0.25),
-    q50 = safe_quantile(z, 0.50),
-    q75 = safe_quantile(z, 0.75),
-    q95 = safe_quantile(z, 0.95),
-    q99 = safe_quantile(z, 0.99),
-    .groups = "drop"
-  ) %>%
-  pivot_longer(
-    cols = starts_with("q"),
-    names_to = "quantile",
-    values_to = "z_value"
-  )
-
-ggplot(quantile_tbl, aes(x = passage_position, y = z_value, color = quantile)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 1.8) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
-  scale_x_continuous(breaks = passage_tbl$passage_position) +
-  labs(
-    title = "Residual quantile profiles by passage",
-    subtitle = "This makes it easier to see whether changes are central, broad, or confined to the upper tail",
-    x = "Passage position within lineage",
-    y = "Residual z",
-    color = "Quantile"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-```{r sampled-density-by-passage}
-set.seed(2)
-density_tbl <- cell_tbl %>%
-  filter(is.finite(z), p_real >= 0.5) %>%
-  group_by(passage_position, passage_id) %>%
-  sample_n(size = min(n(), 4000)) %>%
-  ungroup() %>%
-  mutate(passage_label = paste0("P", passage_position, ": ", passage_id))
-
-ggplot(density_tbl, aes(x = z)) +
-  geom_density(fill = "#7fb069", alpha = 0.6, color = "#2f5233") +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
-  facet_wrap(~ passage_label, scales = "free_y") +
-  labs(
-    title = "Residual distribution by passage",
-    subtitle = "Panels use objects with p_real >= 0.5 to suppress the nuisance population visually",
-    x = "Residual z",
-    y = "Density"
-  ) +
-  theme_minimal(base_size = 11)
-```
-
-## Reading The Outputs
-
-The plots above support a compact interpretation:
-
-- `median_z` tracks whether the typical cell is larger or smaller than expected for its growth state.
-- `iqr_z` tracks dispersion after adjustment.
-- `q95_z`, `q99_z`, `frac_z_gt_2`, and `frac_z_gt_3` track rare large-cell burden.
-- `nuisance_fraction` tracks the low-area junk or fragmented-object burden.
-
-Practical reading guide:
-
-1. Start with the nuisance plots. If a passage has a large nuisance fraction, treat downstream shifts cautiously.
-2. Check the residual-vs-time and residual-vs-confluence diagnostics. If the smooths are not close to flat, the baseline model still has growth-state confounding.
-3. Use the center/spread plot to detect broad distributional drift.
-4. Use the upper-tail and quantile-profile plots to detect rare large-cell subpopulations.
-5. Use the faceted densities to confirm whether a passage shift is global or tail-specific.
+1. Look at the transition ranking table and scatter to find candidate lineages.
+2. Use the heatmap to see whether a lineage has one abrupt change or a more gradual trajectory.
+3. Inspect the focus-lineage trend plots to see whether the signal is central, broad, or upper-tail-specific.
+4. Check the candidate image panel to decide whether the statistical change is visually credible.
 
 ## Render
 
@@ -405,8 +569,11 @@ Practical reading guide:
 rmarkdown::render(
   "workflows/lineage_area_review.Rmd",
   params = list(
-    lineage_id = "7",
-    analysis_dir = "data/lineage_area/lineage_7"
+    lineage_id = NULL,
+    all_results_dir = "data/lineage_area",
+    manifest_csv = "manifests/image_manifest.csv",
+    show_images = TRUE,
+    max_images = 10
   )
 )
 ```

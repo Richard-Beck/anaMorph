@@ -3,8 +3,8 @@
 #SBATCH --output=logs/lineage_area_%A_%a.out
 #SBATCH --error=logs/lineage_area_%A_%a.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=16G
 #SBATCH --time=08:00:00
 #SBATCH --qos=normal
 #SBATCH --array=1-88
