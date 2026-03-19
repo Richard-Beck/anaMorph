@@ -3,5 +3,6 @@ data/dev_subset_image_summary.csv
 data/dev_subset_object_summary.csv
 data/dev_subset_overlays/
 data/dev_unsupervised_analysis/
+data/
 data/all_images/
 logs/

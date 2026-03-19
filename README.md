@@ -123,6 +123,18 @@ Rscript R/build_all_image_object_sizes.R \
   --out_rds data/all_images/object_sizes.rds
 ```
 
+To analyze cell-area residual distributions for one lineage at a time:
+
+```bash
+Rscript R/analyze_single_lineage_area.R \
+  --lineage_id 7 \
+  --lineage_rds core_data/lineages.Rds \
+  --object_sizes_rds data/all_images/object_sizes.rds \
+  --out_dir data/lineage_area
+```
+
+This writes one lineage-specific folder with per-cell residuals plus image- and passage-level summaries after a small-object mixture adjustment and growth-state normalization.
+
 ## Design intent
 
 - Do not change the canonical HPC folder layout.
