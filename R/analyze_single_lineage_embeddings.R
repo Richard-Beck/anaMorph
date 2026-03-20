@@ -68,6 +68,28 @@ ensure_dir <- function(path) {
   }
 }
 
+warning_state <- new.env(parent = emptyenv())
+warning_state$messages <- character()
+warning_state$log_path <- NULL
+
+reset_warning_state <- function(log_path = NULL) {
+  warning_state$messages <- character()
+  warning_state$log_path <- log_path
+  if (!is.null(log_path) && file.exists(log_path)) {
+    file.remove(log_path)
+  }
+}
+
+emit_warning <- function(message_text) {
+  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  line <- sprintf("[%s] WARNING: %s", timestamp, message_text)
+  warning_state$messages <- c(warning_state$messages, line)
+  cat(line, "\n", sep = "")
+  if (!is.null(warning_state$log_path)) {
+    write(line, file = warning_state$log_path, append = TRUE)
+  }
+}
+
 extract_lineage <- function(lineages, lineage_id) {
   if (lineage_id %in% names(lineages)) {
     return(lineages[[lineage_id]])
@@ -284,7 +306,13 @@ write_representative_crops <- function(score_dt, pc_name, out_dir, n_each) {
     "bbox_min_row", "bbox_min_col", "bbox_max_row", "bbox_max_col", pc_name
   )
   if (!all(required_cols %in% names(score_dt))) {
-    warning(sprintf("Skipping crop export for %s because bbox/raw/mask columns are missing.", pc_name), call. = FALSE)
+    missing_cols <- setdiff(required_cols, names(score_dt))
+    emit_warning(sprintf(
+      "Skipping crop export for %s in %s because required columns are missing: %s",
+      pc_name,
+      out_dir,
+      paste(missing_cols, collapse = ", ")
+    ))
     return(invisible(NULL))
   }
 
@@ -294,7 +322,11 @@ write_representative_crops <- function(score_dt, pc_name, out_dir, n_each) {
       !is.na(mask_relpath) & nzchar(mask_relpath)
   ]
   if (!nrow(valid_dt)) {
-    warning(sprintf("No valid rows available for crop export on %s.", pc_name), call. = FALSE)
+    emit_warning(sprintf(
+      "No valid rows available for crop export on %s in %s. Rows require finite scores and non-empty raw_relpath/mask_relpath.",
+      pc_name,
+      out_dir
+    ))
     return(invisible(NULL))
   }
 
@@ -312,7 +344,14 @@ write_representative_crops <- function(score_dt, pc_name, out_dir, n_each) {
       image_path <- group_dt$raw_relpath[[1]]
       mask_path <- group_dt$mask_relpath[[1]]
       if (!file.exists(image_path) || !file.exists(mask_path)) {
-        warning(sprintf("Missing raw or mask TIFF for image %s; skipping crop export.", group_dt$image_id[[1]]), call. = FALSE)
+        emit_warning(sprintf(
+          "Missing raw or mask TIFF for image %s while exporting %s/%s. raw_relpath=%s mask_relpath=%s",
+          group_dt$image_id[[1]],
+          basename(dirname(out_dir)),
+          side_name,
+          image_path,
+          mask_path
+        ))
         next
       }
 
@@ -367,6 +406,7 @@ main <- function() {
   embedding_dir <- project_path(project_root, args$embedding_dir)
   out_dir <- file.path(project_path(project_root, args$out_dir), paste0("lineage_", args$lineage_id))
   ensure_dir(out_dir)
+  reset_warning_state(file.path(out_dir, "warning_log.txt"))
 
   if (!file.exists(lineage_rds)) {
     stop(sprintf("Lineage RDS not found: %s", lineage_rds), call. = FALSE)
@@ -451,27 +491,21 @@ main <- function() {
   resolved_meta_all <- data.table::copy(resolved_meta)
   duplicate_meta <- resolved_meta_all[, .N, by = .(image_id)][N > 1L]
   if (nrow(duplicate_meta)) {
-    warning(
-      sprintf(
-        "Collapsing duplicated lineage image metadata for %d image_id values: %s",
-        nrow(duplicate_meta),
-        paste(duplicate_meta$image_id, collapse = ", ")
-      ),
-      call. = FALSE
-    )
+    emit_warning(sprintf(
+      "Collapsing duplicated lineage image metadata for %d image_id values: %s",
+      nrow(duplicate_meta),
+      paste(duplicate_meta$image_id, collapse = ", ")
+    ))
   }
   resolved_meta <- resolved_meta_all[order(image_id, passage_number)][, .SD[1], by = image_id]
 
   missing_embedding <- resolved_meta[is.na(embedding_path) | !nzchar(embedding_path)]
   if (nrow(missing_embedding)) {
-    warning(
-      sprintf(
-        "Missing embedding CSV for %d lineage images: %s",
-        nrow(missing_embedding),
-        paste(missing_embedding$image_id, collapse = ", ")
-      ),
-      call. = FALSE
-    )
+    emit_warning(sprintf(
+      "Missing embedding CSV for %d lineage images: %s",
+      nrow(missing_embedding),
+      paste(missing_embedding$image_id, collapse = ", ")
+    ))
   }
 
   embedding_tables <- lapply(seq_len(nrow(resolved_meta)), function(i) {
@@ -549,7 +583,7 @@ main <- function() {
 
     quantile_dt <- object_dt[quantile == quantile_name]
     if (!nrow(quantile_dt)) {
-      warning(sprintf("No cell rows available for %s in lineage %s.", quantile_name, args$lineage_id), call. = FALSE)
+      emit_warning(sprintf("No cell rows available for %s in lineage %s.", quantile_name, args$lineage_id))
       next
     }
 
@@ -560,7 +594,7 @@ main <- function() {
     feature_mat <- feature_mat[keep_rows, , drop = FALSE]
 
     if (nrow(feature_mat) < 3L) {
-      warning(sprintf("Too few complete rows for PCA in %s of lineage %s.", quantile_name, args$lineage_id), call. = FALSE)
+      emit_warning(sprintf("Too few complete rows for PCA in %s of lineage %s.", quantile_name, args$lineage_id))
       next
     }
 
@@ -627,6 +661,10 @@ main <- function() {
   cat(sprintf("Lineage: %s\n", args$lineage_id))
   cat(sprintf("Images in lineage: %d\n", nrow(image_counts)))
   cat(sprintf("Cells loaded: %d\n", nrow(object_dt)))
+  cat(sprintf("Warnings emitted: %d\n", length(warning_state$messages)))
+  if (length(warning_state$messages)) {
+    cat(sprintf("Warning log: %s\n", normalize_relpath(warning_state$log_path)))
+  }
   cat(sprintf("Output written to %s\n", normalize_relpath(out_dir)))
 }
 
