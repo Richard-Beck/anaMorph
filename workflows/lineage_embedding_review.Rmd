@@ -305,7 +305,7 @@ for (bundle in lineage_bundles) {
 
     if (!is.null(q_bundle$correlations) && nrow(q_bundle$correlations)) {
       cat("\nTop PCs by absolute passage correlation:\n\n")
-      print(knitr::kable(as_tibble(q_bundle$correlations) %>% slice_head(n = min(10, n())), digits = 3))
+      print(knitr::kable(as_tibble(q_bundle$correlations) %>% slice_head(n = min(10, nrow(q_bundle$correlations))), digits = 3))
       cat("\n\n")
     }
 
