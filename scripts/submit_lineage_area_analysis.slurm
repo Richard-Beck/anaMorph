@@ -12,7 +12,7 @@
 set -euo pipefail
 
 LINEAGE_RDS=${1:-"core_data/lineages.Rds"}
-OBJECT_SIZES_RDS=${2:-"data/all_images/object_sizes.rds"}
+EMBEDDING_DIR=${2:-"data/all_images/embeddings"}
 OUT_DIR=${3:-"data/lineage_area"}
 CONTAINER_URI=${4:-"docker://dockerhub.moffitt.org/hpc/rocker-rstudio:4.4.2"}
 
@@ -35,7 +35,7 @@ echo "Job ID: ${SLURM_JOB_ID}"
 echo "Array task: ${TASK_ID}"
 echo "Repo root: ${REPO_ROOT}"
 echo "Lineage RDS: ${LINEAGE_RDS}"
-echo "Object sizes RDS: ${OBJECT_SIZES_RDS}"
+echo "Embedding dir: ${EMBEDDING_DIR}"
 echo "Output dir: ${OUT_DIR}"
 echo "Container: ${CONTAINER_URI}"
 echo "=========================================================="
@@ -49,7 +49,7 @@ apptainer exec ${BINDS} "${CONTAINER_URI}" \
   Rscript R/analyze_single_lineage_area.R \
     --lineage_id "${LINEAGE_ID}" \
     --lineage_rds "${LINEAGE_RDS}" \
-    --object_sizes_rds "${OBJECT_SIZES_RDS}" \
+    --embedding_dir "${EMBEDDING_DIR}" \
     --out_dir "${OUT_DIR}"
 
 echo "=========================================================="

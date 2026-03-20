@@ -178,11 +178,23 @@ smooth_series <- function(x) {
 lineage_trend_summary <- function(df) {
   df <- df %>% arrange(passage_position)
   n_passages <- nrow(df)
-  if (n_passages < 3) {
+  start_passage_id <- df$passage_id[[1]]
+  end_passage_id <- df$passage_id[[n_passages]]
+
+  score_df <- df %>%
+    filter(
+      is.finite(median_z) |
+      is.finite(iqr_z) |
+      is.finite(q99_z) |
+      is.finite(frac_z_gt_3)
+    ) %>%
+    arrange(passage_position)
+
+  if (nrow(score_df) < 3) {
     return(tibble(
       n_passages = n_passages,
-      start_passage_id = df$passage_id[[1]],
-      end_passage_id = df$passage_id[[n_passages]],
+      start_passage_id = start_passage_id,
+      end_passage_id = end_passage_id,
       smooth_delta_median_z = NA_real_,
       smooth_delta_iqr_z = NA_real_,
       smooth_delta_q99_z = NA_real_,
@@ -196,10 +208,10 @@ lineage_trend_summary <- function(df) {
     ))
   }
 
-  med_s <- smooth_series(df$median_z)
-  iqr_s <- smooth_series(df$iqr_z)
-  q99_s <- smooth_series(df$q99_z)
-  frac_s <- smooth_series(df$frac_z_gt_3)
+  med_s <- smooth_series(score_df$median_z)
+  iqr_s <- smooth_series(score_df$iqr_z)
+  q99_s <- smooth_series(score_df$q99_z)
+  frac_s <- smooth_series(score_df$frac_z_gt_3)
 
   calc_monotonicity <- function(x) {
     net <- abs(x[[length(x)]] - x[[1]])
@@ -228,14 +240,14 @@ lineage_trend_summary <- function(df) {
 
   tibble(
     n_passages = n_passages,
-    start_passage_id = df$passage_id[[1]],
-    end_passage_id = df$passage_id[[n_passages]],
+    start_passage_id = start_passage_id,
+    end_passage_id = end_passage_id,
     smooth_delta_median_z = delta_med,
     smooth_delta_iqr_z = delta_iqr,
     smooth_delta_q99_z = delta_q99,
     smooth_delta_frac_z_gt_3 = delta_frac,
-    max_adjacent_jump_q99_z = max(abs(diff(df$q99_z)), na.rm = TRUE),
-    max_adjacent_jump_frac_z_gt_3 = max(abs(diff(df$frac_z_gt_3)), na.rm = TRUE),
+    max_adjacent_jump_q99_z = max(abs(diff(score_df$q99_z)), na.rm = TRUE),
+    max_adjacent_jump_frac_z_gt_3 = max(abs(diff(score_df$frac_z_gt_3)), na.rm = TRUE),
     monotonicity_median = monotonicity_median,
     monotonicity_q99 = monotonicity_q99,
     monotonicity_frac_z_gt_3 = monotonicity_frac,

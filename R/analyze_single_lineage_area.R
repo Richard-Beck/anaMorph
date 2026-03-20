@@ -1,7 +1,7 @@
 parse_args <- function(args) {
   parsed <- list(
     lineage_rds = "core_data/lineages.Rds",
-    object_sizes_rds = "data/all_images/object_sizes.rds",
+    embedding_dir = "data/all_images/embeddings",
     out_dir = "data/lineage_area"
   )
 
@@ -211,7 +211,7 @@ extract_lineage <- function(lineages, lineage_id) {
   lineages[[which(hit)[[1]]]]
 }
 
-build_lineage_cell_table <- function(lineage_obj, object_sizes) {
+build_lineage_image_meta <- function(lineage_obj) {
   passage_positions <- stats::setNames(seq_along(lineage_obj$passage_ids), lineage_obj$passage_ids)
   image_meta_list <- lapply(names(lineage_obj$passages), function(passage_id) {
     passage_dt <- data.table::as.data.table(lineage_obj$passages[[passage_id]])
@@ -241,9 +241,13 @@ build_lineage_cell_table <- function(lineage_obj, object_sizes) {
   image_meta[, confluence_um2 := suppressWarnings(as.numeric(areaOccupied_um2))]
   image_meta[, log_confluence := log1p(pmax(confluence_um2, 0))]
 
+  image_meta
+}
+
+build_lineage_cell_table <- function(image_meta, object_sizes) {
   matched_keys <- intersect(image_meta$image_key, names(object_sizes))
   if (!length(matched_keys)) {
-    stop("No image keys from this lineage matched names(object_sizes).", call. = FALSE)
+    stop("No image keys from this lineage matched embedding CSVs.", call. = FALSE)
   }
 
   image_meta <- image_meta[image_key %in% matched_keys]
@@ -277,6 +281,46 @@ build_lineage_cell_table <- function(lineage_obj, object_sizes) {
   data.table::rbindlist(cell_tables, fill = TRUE)
 }
 
+load_lineage_object_sizes <- function(image_meta, embedding_dir) {
+  if (!dir.exists(embedding_dir)) {
+    stop(sprintf("Embedding directory not found: %s", embedding_dir), call. = FALSE)
+  }
+
+  image_keys <- unique(as.character(image_meta$image_key))
+  image_keys <- image_keys[!is.na(image_keys) & nzchar(image_keys)]
+  embedding_paths <- file.path(embedding_dir, paste0(image_keys, "_embeddings.csv"))
+  found <- file.exists(embedding_paths)
+
+  if (!any(found)) {
+    stop(
+      sprintf(
+        "No embedding CSVs found for any of %d lineage images under %s",
+        length(image_keys),
+        embedding_dir
+      ),
+      call. = FALSE
+    )
+  }
+
+  object_sizes <- lapply(embedding_paths[found], function(path) {
+    data.table::fread(path, select = c("label", "area_px"))
+  })
+  names(object_sizes) <- image_keys[found]
+
+  if (any(!found)) {
+    warning(
+      sprintf(
+        "Missing embedding CSVs for %d of %d lineage images.",
+        sum(!found),
+        length(found)
+      ),
+      call. = FALSE
+    )
+  }
+
+  object_sizes
+}
+
 summarize_group <- function(dt, group_cols) {
   dt[, .(
     n_objects = .N,
@@ -298,15 +342,16 @@ summarize_group <- function(dt, group_cols) {
 args <- parse_args(commandArgs(trailingOnly = TRUE))
 project_root <- resolve_project_root()
 lineage_rds <- project_path(project_root, args$lineage_rds)
-object_sizes_rds <- project_path(project_root, args$object_sizes_rds)
+embedding_dir <- project_path(project_root, args$embedding_dir)
 out_dir <- project_path(project_root, file.path(args$out_dir, paste0("lineage_", args$lineage_id)))
 
 ensure_dir(out_dir)
 
 lineages <- readRDS(lineage_rds)
-object_sizes <- readRDS(object_sizes_rds)
 lineage_obj <- extract_lineage(lineages, args$lineage_id)
-cell_dt <- build_lineage_cell_table(lineage_obj, object_sizes)
+image_meta <- build_lineage_image_meta(lineage_obj)
+object_sizes <- load_lineage_object_sizes(image_meta, embedding_dir)
+cell_dt <- build_lineage_cell_table(image_meta, object_sizes)
 
 if (!nrow(cell_dt)) {
   stop("No object rows available for this lineage.", call. = FALSE)
@@ -347,21 +392,39 @@ image_summary <- summarize_group(
   c("lineage_id", "passage_id", "passage_position", "image_id", "image_key", "filename", "field")
 )
 
-passage_summary <- summarize_group(
+passage_summary_core <- summarize_group(
   cell_dt,
   c("lineage_id", "passage_id", "passage_position")
 )
 
+passage_index <- data.table::data.table(
+  lineage_id = as.character(lineage_obj$lineage_id),
+  passage_id = as.character(lineage_obj$passage_ids),
+  passage_position = seq_along(lineage_obj$passage_ids)
+)
+
+passage_manifest_summary <- image_meta[, .(
+  n_manifest_images = .N,
+  n_matched_images = sum(image_key %in% names(object_sizes)),
+  first_image_time = if (all(is.na(image_time))) as.POSIXct(NA, tz = "UTC") else min(image_time, na.rm = TRUE),
+  mean_confluence_um2 = mean(confluence_um2, na.rm = TRUE)
+), by = .(passage_id, passage_position)]
+
 passage_summary <- merge(
-  passage_summary,
-  unique(cell_dt[, .(
-    first_image_time = if (all(is.na(image_time))) as.POSIXct(NA, tz = "UTC") else min(image_time, na.rm = TRUE),
-    mean_confluence_um2 = mean(confluence_um2, na.rm = TRUE)
-  ), by = passage_id]),
-  by = "passage_id",
+  passage_index,
+  passage_manifest_summary,
+  by = c("passage_id", "passage_position"),
   all.x = TRUE,
   sort = FALSE
 )
+passage_summary <- merge(
+  passage_summary,
+  passage_summary_core,
+  by = c("lineage_id", "passage_id", "passage_position"),
+  all.x = TRUE,
+  sort = FALSE
+)
+data.table::setorder(passage_summary, passage_position)
 
 out_rds <- file.path(out_dir, "lineage_area_analysis.rds")
 out_cells_csv <- file.path(out_dir, "cell_residuals.csv")
@@ -387,6 +450,6 @@ utils::write.csv(passage_summary, out_passages_csv, row.names = FALSE, na = "")
 
 cat(sprintf("Lineage: %s\n", lineage_obj$lineage_id))
 cat(sprintf("Passages: %d\n", length(lineage_obj$passage_ids)))
-cat(sprintf("Images matched to object sizes: %d\n", length(unique(cell_dt$image_key))))
+cat(sprintf("Images matched to embeddings: %d\n", length(unique(cell_dt$image_key))))
 cat(sprintf("Objects analyzed: %d\n", nrow(cell_dt)))
 cat(sprintf("Wrote analysis RDS: %s\n", out_rds))
