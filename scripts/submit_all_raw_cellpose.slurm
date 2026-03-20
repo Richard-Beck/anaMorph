@@ -19,7 +19,7 @@
 # Environment Setup & Job Execution
 #----------------------------------------------------------------#
 
-set -euo pipefail
+set -eo pipefail
 
 echo "=========================================================="
 echo "Job Started at $(date)"
@@ -31,7 +31,9 @@ mkdir -p logs
 mkdir -p data/all_images/manifests
 
 source /app/eb/software/Anaconda3/2024.02-1/etc/profile.d/conda.sh
+set +u
 conda activate cpose
+set -u
 
 echo "Python environment activated. Running the script..."
 python scripts/run_all_raw_cellpose.py \
