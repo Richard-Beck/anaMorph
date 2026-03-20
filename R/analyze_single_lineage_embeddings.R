@@ -115,7 +115,7 @@ build_lineage_image_meta <- function(lineage_obj) {
   if ("filename" %in% names(meta_dt)) {
     meta_dt[, filename := as.character(filename)]
   }
-  data.table::unique(meta_dt, by = intersect(c("id", "filename", "passage_id"), names(meta_dt)))
+  unique(meta_dt, by = intersect(c("id", "filename", "passage_id"), names(meta_dt)))
 }
 
 candidate_embedding_paths <- function(project_root, embedding_dir, image_id, filename = NA_character_) {
