@@ -172,9 +172,10 @@ plot_top_pc_correlations <- function(cor_dt, lineage_id, quantile_name, top_n = 
   if (is.null(cor_dt) || !nrow(cor_dt)) {
     return(NULL)
   }
+  keep_n <- min(top_n, nrow(cor_dt))
   plot_dt <- cor_dt %>%
     as_tibble() %>%
-    slice_head(n = min(top_n, n())) %>%
+    slice_head(n = keep_n) %>%
     mutate(pc = factor(pc, levels = rev(pc)))
 
   ggplot(plot_dt, aes(x = pc, y = correlation, fill = correlation > 0)) +
