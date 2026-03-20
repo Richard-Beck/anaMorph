@@ -88,22 +88,19 @@ extract_lineage <- function(lineages, lineage_id) {
 build_lineage_image_meta <- function(lineage_obj) {
   passage_positions <- stats::setNames(seq_along(lineage_obj$passage_ids), lineage_obj$passage_ids)
   meta_list <- lapply(names(lineage_obj$passages), function(passage_id) {
-    passage_dt <- data.table::as.data.table(lineage_obj$passages[[passage_id]])
+    current_passage_id <- as.character(passage_id)
+    current_passage_number <- as.integer(passage_positions[[current_passage_id]])
+    passage_dt <- data.table::as.data.table(lineage_obj$passages[[current_passage_id]])
     if (!nrow(passage_dt)) {
       return(NULL)
     }
 
     out <- data.table::copy(passage_dt)
-    out[, passage_id := as.character(passage_id)]
-    out[, passage_number := as.integer(passage_positions[[passage_id]])]
     keep_cols <- intersect(c("id", "filename", "filepath", "field", "date"), names(out))
-    out[, ..keep_cols][
-      ,
-      `:=`(
-        passage_id = as.character(passage_id),
-        passage_number = as.integer(passage_positions[[passage_id]])
-      )
-    ]
+    keep_dt <- out[, ..keep_cols]
+    keep_dt[, passage_id := current_passage_id]
+    keep_dt[, passage_number := current_passage_number]
+    keep_dt
   })
 
   meta_dt <- data.table::rbindlist(meta_list, use.names = TRUE, fill = TRUE)
