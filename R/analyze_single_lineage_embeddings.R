@@ -464,6 +464,9 @@ main <- function() {
     seg_dt[, source_filepath := as.character(source_filepath)]
     seg_dt[, source_basename := basename(source_filepath)]
   }
+  if ("source_filepath" %in% names(seg_dt)) {
+    seg_dt[, source_filepath := project_path(project_root, normalize_relpath(source_filepath))]
+  }
   for (path_col in intersect(c("raw_relpath", "mask_relpath", "embedding_relpath"), names(seg_dt))) {
     seg_dt[, (path_col) := project_path(project_root, normalize_relpath(get(path_col)))]
   }
@@ -482,6 +485,8 @@ main <- function() {
       }
       if ("raw_relpath" %in% names(seg_row) && file.exists(seg_row$raw_relpath[[1]])) {
         raw_path <- seg_row$raw_relpath[[1]]
+      } else if ("source_filepath" %in% names(seg_row) && file.exists(seg_row$source_filepath[[1]])) {
+        raw_path <- seg_row$source_filepath[[1]]
       }
       if ("mask_relpath" %in% names(seg_row) && file.exists(seg_row$mask_relpath[[1]])) {
         mask_path <- seg_row$mask_relpath[[1]]
