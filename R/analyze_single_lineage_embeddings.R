@@ -98,6 +98,11 @@ build_lineage_image_meta <- function(lineage_obj) {
     out <- data.table::copy(passage_dt)
     keep_cols <- intersect(c("id", "filename", "filepath", "field", "date"), names(out))
     keep_dt <- out[, ..keep_cols]
+    keep_dt[, image_id := if ("filename" %in% names(keep_dt)) {
+      ifelse(!is.na(filename) & nzchar(filename), as.character(filename), as.character(id))
+    } else {
+      as.character(id)
+    }]
     keep_dt[, passage_id := current_passage_id]
     keep_dt[, passage_number := current_passage_number]
     keep_dt
@@ -112,10 +117,13 @@ build_lineage_image_meta <- function(lineage_obj) {
     stop("Lineage image metadata is missing `id`.", call. = FALSE)
   }
   meta_dt[, id := as.character(id)]
+  if ("image_id" %in% names(meta_dt)) {
+    meta_dt[, image_id := as.character(image_id)]
+  }
   if ("filename" %in% names(meta_dt)) {
     meta_dt[, filename := as.character(filename)]
   }
-  unique(meta_dt, by = intersect(c("id", "filename", "passage_id"), names(meta_dt)))
+  unique(meta_dt, by = intersect(c("image_id", "filename", "passage_id"), names(meta_dt)))
 }
 
 candidate_embedding_paths <- function(project_root, embedding_dir, image_id, filename = NA_character_) {
@@ -386,14 +394,14 @@ main <- function() {
     row <- image_meta[i]
     seg_row <- NULL
 
-    if ("id" %in% names(seg_dt)) {
-      seg_row <- seg_dt[id == row$id[[1]]]
+    if ("filename" %in% names(seg_dt) && "filename" %in% names(row)) {
+      seg_row <- seg_dt[filename == row$filename[[1]]]
       if (nrow(seg_row)) {
         seg_row <- seg_row[1]
       }
     }
-    if ((is.null(seg_row) || !nrow(seg_row)) && "filename" %in% names(seg_dt) && "filename" %in% names(row)) {
-      seg_row <- seg_dt[filename == row$filename[[1]]]
+    if ((is.null(seg_row) || !nrow(seg_row)) && "id" %in% names(seg_dt)) {
+      seg_row <- seg_dt[id == row$id[[1]]]
       if (nrow(seg_row)) {
         seg_row <- seg_row[1]
       }
@@ -419,7 +427,7 @@ main <- function() {
       candidates <- candidate_embedding_paths(
         project_root = project_root,
         embedding_dir = embedding_dir,
-        image_id = row$id[[1]],
+        image_id = row$image_id[[1]],
         filename = if ("filename" %in% names(row)) row$filename[[1]] else NA_character_
       )
       existing <- candidates[file.exists(candidates)]
@@ -429,7 +437,7 @@ main <- function() {
     }
 
     data.table::data.table(
-      image_id = as.character(row$id[[1]]),
+      image_id = as.character(row$image_id[[1]]),
       filename = if ("filename" %in% names(row)) as.character(row$filename[[1]]) else NA_character_,
       filepath = if ("filepath" %in% names(row)) as.character(row$filepath[[1]]) else NA_character_,
       passage_id = as.character(row$passage_id[[1]]),
