@@ -175,7 +175,7 @@ plot_top_pc_correlations <- function(cor_dt, lineage_id, quantile_name, top_n = 
   keep_n <- min(top_n, nrow(cor_dt))
   plot_dt <- cor_dt %>%
     as_tibble() %>%
-    slice_head(n = keep_n) %>%
+    .[seq_len(keep_n), , drop = FALSE] %>%
     mutate(pc = factor(pc, levels = rev(pc)))
 
   ggplot(plot_dt, aes(x = pc, y = correlation, fill = correlation > 0)) +
@@ -305,7 +305,8 @@ for (bundle in lineage_bundles) {
 
     if (!is.null(q_bundle$correlations) && nrow(q_bundle$correlations)) {
       cat("\nTop PCs by absolute passage correlation:\n\n")
-      print(knitr::kable(as_tibble(q_bundle$correlations) %>% slice_head(n = min(10, nrow(q_bundle$correlations))), digits = 3))
+      cor_preview <- as_tibble(q_bundle$correlations)[seq_len(min(10, nrow(q_bundle$correlations))), , drop = FALSE]
+      print(knitr::kable(cor_preview, digits = 3))
       cat("\n\n")
     }
 
