@@ -205,6 +205,7 @@ build_media_col <- function(samples, media_tbl) {
 
   names(out)[names(out) == "id"] <- "media_id"
   keep_cols <- vapply(out, function(col) length(unique(col)) > 1L, logical(1))
+  out <- as.data.frame(out, stringsAsFactors = FALSE)
   out[, keep_cols, drop = FALSE]
 }
 

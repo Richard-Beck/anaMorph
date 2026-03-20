@@ -10,12 +10,17 @@ knitr::opts_knit$set(root.dir = "C:/Users/4473331/Documents/projects/021_ltee_mo
 ```
 
 ```{r}
-
 source("R/db_utils.R")
+source("R/workflow_utils.R")
+source("R/plot_utils.R")
+```
 
+
+```{r}
 x <- data.table::fread("core_data/passaging.csv")
 
 mani <- data.table::fread("manifests/image_manifest.csv")
+media_tbl <- data.table::fread("core_data/media.csv")
 
 db_col <- collapse_db(x)
 
@@ -28,87 +33,95 @@ db_col$passaging$imaged <- db_col$passaging$passage_id%in%im_pass
 ```
 
 ```{r}
-p <- unique(as.data.frame(db_col$passaging)[, c("passage_id","passage_from","imaged")], by="passage_id")
-p$passage_id <- as.character(p$passage_id)
-p$passage_from <- as.character(p$passage_from)
-
-im <- p$passage_id[p$imaged %in% TRUE]
-parent_of <- setNames(p$passage_from, p$passage_id)
-
-im_edges <- p[p$imaged %in% TRUE & !is.na(p$passage_from) & p$passage_from %in% im, ]
-tips <- setdiff(im, unique(im_edges$passage_from))
-
-lineages <- lapply(tips, function(tip){
-  lin <- tip
-  cur <- tip
-  repeat{
-    par <- parent_of[[cur]]
-    if(is.null(par) || is.na(par) || !(par %in% im)) break
-    lin <- c(lin, par)
-    cur <- par
+tree_build <- build_connected_trees(db_col, mani$id)
+tree_build$connected_trees <- assign_conditions_to_trees(
+  tree_build$connected_trees,
+  db_col$samples,
+  media_tbl
+)$connected_trees
+tree_build$connected_trees <- Filter(function(tree) {
+  condition_df <- tree$tree_conditions
+  if (is.null(condition_df) || !nrow(condition_df)) {
+    return(FALSE)
   }
-  lin
+  conditions <- unique(condition_df$condition[!is.na(condition_df$condition) & nzchar(condition_df$condition)])
+  length(conditions) > 1L
+}, tree_build$connected_trees)
+
+tree_plots <- lapply(seq_along(tree_build$connected_trees), function(i) {
+  print(i)
+  plot_passage_tree(
+    tree_build$connected_trees[[i]],
+    component_name = names(tree_build$connected_trees)[i]
+  )
 })
+```
+We need a way to programatically collect the relevant lineages for our LTEE analysis. Since that is lacking, for now I will manually identify some lineages where we know a WGD event exists, in order to develop the image analysis workflow further:
 
-lin_dt <- do.call(rbind, lapply(seq_along(lineages), function(i){
-  data.frame(lineage_id=i, position=seq_along(lineages[[i]]), passage_id=lineages[[i]], stringsAsFactors=FALSE)
-}))
+```{r}
+## manual_lineages found within: tree_build$connected_trees[["SUM-159_NLS_mCherry"]]
 
-comment_lut <- grepl("LTEE", x$comment)
-names(comment_lut) <- x$id
-lin_dt$ltee <- comment_lut[lin_dt$passage_id]
+manual_lineages <- data.frame(tips=c("SUM-159_NLS_2N_O1_A24_seed",
+                            "SUM-159_NLS_2N_O2_A24_seed",
+                            "SUM-159_NLS_2N_C_A12_seed"),
+                            roots=c("SUM-159_NLS_2N_O1_A1_seed",
+                                    "SUM-159_NLS_2N_O2_A1_seed",
+                                    "SUM-159_NLS_2N_C_A1_seed"))
 
-lin_dt <- do.call(rbind, lapply(split(lin_dt, lin_dt$lineage_id), function(i){
-  if(sum(i$ltee, na.rm=TRUE) == 0) return(NULL)
-  i
-}))
+```
 
-lin_list <- split(lin_dt$passage_id, lin_dt$lineage_id)
 
-keep <- rep(TRUE, length(lin_list))
-
-for(i in seq_along(lin_list)){
-  tail_i <- lin_list[[i]][-1]
-  if(length(tail_i) == 0) next
-  for(j in seq_along(lin_list)){
-    if(i == j) next
-    if(all(tail_i %in% lin_list[[j]])){
-      keep[i] <- FALSE
-      break
-    }
-  }
-}
-
-keep_ids <- names(lin_list)[keep]
-lin_dt <- lin_dt[lin_dt$lineage_id %in% keep_ids, ]
-
+```{r}
+parent_of <- setNames(
+  as.character(db_col$passaging$passage_from),
+  as.character(db_col$passaging$passage_id)
+)
 sample_ids_by_passage <- split(
   as.character(db_col$samples$samples),
   as.character(db_col$samples$passage_id)
 )
 
-lineage_objects <- lapply(split(lin_dt, lin_dt$lineage_id), function(lineage_rows) {
-  lineage_rows <- lineage_rows[order(lineage_rows$position, decreasing = TRUE), , drop = FALSE]
-  passage_ids <- as.character(lineage_rows$passage_id)
+build_manual_lineage <- function(root_id, tip_id, lineage_id) {
+  path_rev <- character()
+  cur <- tip_id
+  repeat {
+    if (is.null(cur) || is.na(cur)) {
+      stop("Lineage ", lineage_id, " does not connect tip ", tip_id, " to root ", root_id, ".")
+    }
+    path_rev <- c(path_rev, cur)
+    if (identical(cur, root_id)) {
+      break
+    }
+    cur <- parent_of[[cur]]
+  }
 
+  passage_ids <- rev(path_rev)
   passage_manifest <- setNames(lapply(passage_ids, function(passage_id) {
     sample_ids <- sample_ids_by_passage[[passage_id]]
     mani[mani$id %in% sample_ids, , drop = FALSE]
   }), passage_ids)
 
   list(
-    lineage_id = unique(as.character(lineage_rows$lineage_id)),
+    lineage_id = lineage_id,
+    root_id = root_id,
+    tip_id = tip_id,
     passage_ids = passage_ids,
     passages = passage_manifest
   )
-})
+}
 
-names(lineage_objects) <- vapply(
-  lineage_objects,
-  function(lineage_obj) lineage_obj$lineage_id,
-  character(1)
+lineage_objects <- setNames(
+  lapply(seq_len(nrow(manual_lineages)), function(i) {
+    build_manual_lineage(
+      root_id = as.character(manual_lineages$roots[i]),
+      tip_id = as.character(manual_lineages$tips[i]),
+      lineage_id = paste0("manual_", i)
+    )
+  }),
+  paste0("manual_", seq_len(nrow(manual_lineages)))
 )
 
+saveRDS(lineage_objects,"core_data/lineages.Rds")
 ```
 
 
