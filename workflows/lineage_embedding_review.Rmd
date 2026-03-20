@@ -1,0 +1,332 @@
+---
+title: "Lineage Embedding Review"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  results_dir: "data/lineage_embeddings"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5
+)
+```
+
+## Overview
+
+This notebook reviews the per-lineage embedding analysis outputs saved under `data/lineage_embeddings`.
+
+For each lineage, the workflow:
+
+1. Loads all segmentation embedding tables for lineage images.
+2. Computes per-image cell counts and divides images into count tertiles.
+3. Runs a separate PCA within each tertile using `log1p_area` and `embedding_*`.
+4. Correlates each PC score with passage number.
+5. Exports tiled TIFF panels showing representative low-score and high-score cells for the strongest PCs.
+
+## Packages
+
+```{r packages}
+required_packages <- c(
+  "data.table",
+  "dplyr",
+  "ggplot2",
+  "purrr",
+  "readr",
+  "stringr",
+  "tibble",
+  "tidyr",
+  "tiff"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    sprintf("Install required packages before rendering: %s", paste(missing_packages, collapse = ", ")),
+    call. = FALSE
+  )
+}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(readr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(tiff)
+```
+
+## Helpers
+
+```{r helpers}
+resolve_project_root <- function() {
+  candidates <- c(
+    normalizePath(".", winslash = "/", mustWork = FALSE),
+    normalizePath("..", winslash = "/", mustWork = FALSE),
+    normalizePath("../..", winslash = "/", mustWork = FALSE)
+  )
+
+  for (candidate in unique(candidates)) {
+    if (file.exists(file.path(candidate, "README.md")) &&
+        dir.exists(file.path(candidate, "workflows"))) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate project root from current working directory.", call. = FALSE)
+}
+
+project_root <- resolve_project_root()
+
+project_path <- function(path) {
+  is_absolute <- grepl("^[A-Za-z]:[/\\\\]|^/", path)
+  out <- path
+  out[!is_absolute] <- file.path(project_root, path[!is_absolute])
+  out
+}
+
+read_if_exists <- function(path, reader) {
+  if (!file.exists(path)) {
+    return(NULL)
+  }
+  reader(path)
+}
+
+render_tiff_panel <- function(path, title = basename(path)) {
+  img <- tiff::readTIFF(path, native = FALSE, all = FALSE)
+  if (length(dim(img)) == 3L) {
+    img <- apply(img[, , seq_len(min(3, dim(img)[3])), drop = FALSE], c(1, 2), mean)
+  }
+  img <- as.matrix(img)
+  plot.new()
+  usr <- par("usr")
+  raster_img <- as.raster(img[nrow(img):1, , drop = FALSE], max = 1)
+  rasterImage(raster_img, usr[1], usr[3], usr[2], usr[4], interpolate = FALSE)
+  title(main = title, cex.main = 0.9)
+  invisible(NULL)
+}
+
+discover_lineage_dirs <- function(results_dir) {
+  root <- project_path(results_dir)
+  if (!dir.exists(root)) {
+    stop(sprintf("Results dir not found: %s", root), call. = FALSE)
+  }
+  dirs <- list.dirs(root, recursive = FALSE, full.names = TRUE)
+  dirs[grepl("^lineage_", basename(dirs))]
+}
+
+discover_quantile_dirs <- function(lineage_dir) {
+  dirs <- list.dirs(lineage_dir, recursive = FALSE, full.names = TRUE)
+  dirs[basename(dirs) %in% c("Q1_low", "Q2_mid", "Q3_high")]
+}
+
+read_lineage_bundle <- function(lineage_dir) {
+  lineage_id <- sub("^lineage_", "", basename(lineage_dir))
+  list(
+    lineage_id = lineage_id,
+    lineage_dir = lineage_dir,
+    image_counts = read_if_exists(file.path(lineage_dir, "image_cell_counts.csv"), fread),
+    image_plot = file.path(lineage_dir, "image_cell_count_distribution.png"),
+    warning_log = read_if_exists(file.path(lineage_dir, "warning_log.txt"), readLines),
+    lineage_scores = read_if_exists(file.path(lineage_dir, "lineage_pc_scores.csv"), fread),
+    quantiles = setNames(lapply(discover_quantile_dirs(lineage_dir), function(q_dir) {
+      list(
+        dir = q_dir,
+        name = basename(q_dir),
+        correlations = read_if_exists(file.path(q_dir, "pc_passage_correlations.csv"), fread),
+        scores = read_if_exists(file.path(q_dir, "pc_scores.csv"), fread),
+        top3_panels = list.dirs(file.path(q_dir, "top3_abs_correlation"), recursive = FALSE, full.names = TRUE),
+        top5_panels = list.dirs(file.path(q_dir, "top5_abs_correlation"), recursive = FALSE, full.names = TRUE)
+      )
+    }), basename(discover_quantile_dirs(lineage_dir)))
+  )
+}
+
+build_overview_tbl <- function(lineage_bundles) {
+  bind_rows(lapply(lineage_bundles, function(bundle) {
+    image_counts <- bundle$image_counts
+    tibble(
+      lineage_id = bundle$lineage_id,
+      n_images = if (is.null(image_counts)) NA_integer_ else nrow(image_counts),
+      n_images_with_cells = if (is.null(image_counts)) NA_integer_ else sum(is.finite(image_counts$cell_count) & image_counts$cell_count > 0),
+      median_cell_count = if (is.null(image_counts)) NA_real_ else median(image_counts$cell_count, na.rm = TRUE),
+      max_cell_count = if (is.null(image_counts)) NA_real_ else max(image_counts$cell_count, na.rm = TRUE),
+      n_warnings = length(bundle$warning_log %||% character())
+    )
+  }))
+}
+
+`%||%` <- function(x, y) {
+  if (is.null(x)) y else x
+}
+
+plot_top_pc_correlations <- function(cor_dt, lineage_id, quantile_name, top_n = 10L) {
+  if (is.null(cor_dt) || !nrow(cor_dt)) {
+    return(NULL)
+  }
+  plot_dt <- cor_dt %>%
+    as_tibble() %>%
+    slice_head(n = min(top_n, n())) %>%
+    mutate(pc = factor(pc, levels = rev(pc)))
+
+  ggplot(plot_dt, aes(x = pc, y = correlation, fill = correlation > 0)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c(`TRUE` = "#2C7BB6", `FALSE` = "#D7191C"), guide = "none") +
+    labs(
+      title = sprintf("%s: top PC correlations with passage in %s", lineage_id, quantile_name),
+      x = NULL,
+      y = "Pearson correlation with passage number"
+    ) +
+    theme_bw(base_size = 11)
+}
+
+plot_top_pc_trajectories <- function(score_dt, cor_dt, lineage_id, quantile_name, top_n = 3L) {
+  if (is.null(score_dt) || !nrow(score_dt) || is.null(cor_dt) || !nrow(cor_dt)) {
+    return(NULL)
+  }
+  top_pcs <- head(cor_dt$pc, min(top_n, nrow(cor_dt)))
+  if (!length(top_pcs)) {
+    return(NULL)
+  }
+  plot_dt <- score_dt %>%
+    as_tibble() %>%
+    select(any_of(c("passage_number", top_pcs))) %>%
+    pivot_longer(cols = all_of(top_pcs), names_to = "pc", values_to = "score") %>%
+    group_by(passage_number, pc) %>%
+    summarise(
+      median_score = median(score, na.rm = TRUE),
+      q25 = quantile(score, probs = 0.25, na.rm = TRUE),
+      q75 = quantile(score, probs = 0.75, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  ggplot(plot_dt, aes(x = passage_number, y = median_score, color = pc, fill = pc)) +
+    geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.15, linewidth = 0) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.2) +
+    labs(
+      title = sprintf("%s: top PC trajectories in %s", lineage_id, quantile_name),
+      x = "Passage number",
+      y = "Median PC score"
+    ) +
+    theme_bw(base_size = 11)
+}
+
+collect_panel_files <- function(panel_dirs) {
+  if (is.null(panel_dirs) || !length(panel_dirs)) {
+    return(character())
+  }
+  unlist(lapply(panel_dirs, function(dir) {
+    files <- list.files(dir, pattern = "_panel\\.tiff$", full.names = TRUE)
+    files[order(files)]
+  }))
+}
+```
+
+## Load Results
+
+```{r load-results}
+lineage_dirs <- discover_lineage_dirs(params$results_dir)
+lineage_bundles <- lapply(lineage_dirs, read_lineage_bundle)
+
+if (!length(lineage_bundles)) {
+  stop("No lineage embedding outputs were found.", call. = FALSE)
+}
+```
+
+## Output Summary
+
+```{r overview-table}
+overview_tbl <- build_overview_tbl(lineage_bundles)
+knitr::kable(overview_tbl, digits = 2)
+```
+
+## Cell Count Overview
+
+```{r cross-lineage-cell-counts}
+count_plot_dt <- bind_rows(lapply(lineage_bundles, function(bundle) {
+  if (is.null(bundle$image_counts)) return(NULL)
+  as_tibble(bundle$image_counts) %>% mutate(lineage_id = bundle$lineage_id)
+}))
+
+ggplot(count_plot_dt, aes(x = cell_count, fill = lineage_id)) +
+  geom_histogram(bins = 40, alpha = 0.6, position = "identity") +
+  facet_wrap(~ lineage_id, scales = "free_y") +
+  labs(
+    title = "Per-image cell count distributions by lineage",
+    x = "Cells per image",
+    y = "Images"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+## Detailed Review
+
+```{r detailed-review, results='asis'}
+for (bundle in lineage_bundles) {
+  cat("\n\n## ", bundle$lineage_id, "\n\n", sep = "")
+  cat("Output directory: `", normalizePath(bundle$lineage_dir, winslash = "/", mustWork = FALSE), "`\n\n", sep = "")
+
+  if (file.exists(bundle$image_plot)) {
+    cat("### Image Count Tertiles\n\n")
+    print(knitr::include_graphics(bundle$image_plot))
+    cat("\n\n")
+  }
+
+  if (length(bundle$warning_log %||% character())) {
+    cat("### Warnings\n\n")
+    warning_preview <- head(bundle$warning_log, 20)
+    cat("```text\n", paste(warning_preview, collapse = "\n"), "\n```\n\n", sep = "")
+  }
+
+  for (quantile_name in names(bundle$quantiles)) {
+    q_bundle <- bundle$quantiles[[quantile_name]]
+    cat("### ", quantile_name, "\n\n", sep = "")
+
+    cor_plot <- plot_top_pc_correlations(q_bundle$correlations, bundle$lineage_id, quantile_name)
+    if (!is.null(cor_plot)) {
+      print(cor_plot)
+    }
+
+    traj_plot <- plot_top_pc_trajectories(q_bundle$scores, q_bundle$correlations, bundle$lineage_id, quantile_name)
+    if (!is.null(traj_plot)) {
+      print(traj_plot)
+    }
+
+    if (!is.null(q_bundle$correlations) && nrow(q_bundle$correlations)) {
+      cat("\nTop PCs by absolute passage correlation:\n\n")
+      print(knitr::kable(as_tibble(q_bundle$correlations) %>% slice_head(n = min(10, n())), digits = 3))
+      cat("\n\n")
+    }
+
+    top3_panels <- collect_panel_files(q_bundle$top3_panels)
+    if (length(top3_panels)) {
+      cat("#### Representative Cell Panels: Top 3 Correlated PCs\n\n")
+      for (panel_path in top3_panels) {
+        panel_title <- paste(basename(dirname(panel_path)), basename(panel_path))
+        render_tiff_panel(panel_path, panel_title)
+      }
+      cat("\n")
+    }
+
+    top5_panels <- collect_panel_files(q_bundle$top5_panels)
+    if (length(top5_panels)) {
+      cat("#### Representative Cell Panels: Top 5 Correlated PCs\n\n")
+      for (panel_path in top5_panels) {
+        panel_title <- paste(basename(dirname(panel_path)), basename(panel_path))
+        render_tiff_panel(panel_path, panel_title)
+      }
+      cat("\n")
+    }
+  }
+}
+```
