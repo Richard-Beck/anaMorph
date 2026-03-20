@@ -35,6 +35,11 @@ def parse_args():
     parser.add_argument("--crop-width", type=int, default=1400)
     parser.add_argument("--cellpose-batch-size", type=int, default=16)
     parser.add_argument("--embedding-batch-size", type=int, default=512)
+    parser.add_argument(
+        "--overwrite-existing",
+        action="store_true",
+        help="Reprocess images already present in the segmentation image manifest.",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +56,44 @@ def normalize_relpath(path):
 def iter_batches(items, batch_size):
     for start in range(0, len(items), batch_size):
         yield items[start : start + batch_size]
+
+
+def load_existing_image_manifest(image_manifest_path):
+    if not os.path.exists(image_manifest_path):
+        return pd.DataFrame()
+    existing = pd.read_csv(image_manifest_path)
+    if existing.empty:
+        return existing
+    for col in ("filename", "source_filepath"):
+        if col not in existing.columns:
+            existing[col] = ""
+    return existing
+
+
+def append_manifest_row(csv_path, row):
+    ensure_parent(csv_path)
+    file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def merge_image_manifest(existing_rows, new_rows):
+    frames = []
+    if existing_rows is not None and not existing_rows.empty:
+        frames.append(existing_rows)
+    if new_rows:
+        frames.append(pd.DataFrame(new_rows))
+    if not frames:
+        return pd.DataFrame()
+
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    dedupe_cols = [col for col in ("source_filepath", "filename") if col in merged.columns]
+    if dedupe_cols:
+        merged = merged.drop_duplicates(subset=dedupe_cols, keep="last")
+    return merged
 
 
 def list_raw_images(raw_data_dir):
@@ -224,6 +267,21 @@ def main():
         raise SystemExit(f"No raw TIFF images found in {args.raw_data_dir}")
 
     manifest_rows = [parse_image_metadata(path) for path in filepaths]
+    existing_image_manifest = load_existing_image_manifest(args.image_manifest)
+
+    if not args.overwrite_existing and not existing_image_manifest.empty:
+        processed_sources = set(existing_image_manifest["source_filepath"].dropna().astype(str))
+        processed_filenames = set(existing_image_manifest["filename"].dropna().astype(str))
+        manifest_rows = [
+            row
+            for row in manifest_rows
+            if normalize_relpath(row["filepath"]) not in processed_sources and row["filename"] not in processed_filenames
+        ]
+
+    if not manifest_rows:
+        print("No new raw images to process.")
+        print(f"Existing image manifest: {args.image_manifest}")
+        return
 
     cellpose_model = models.CellposeModel(gpu=True, pretrained_model=args.pretrained_model)
     embedding_model, preprocess = build_embedding_model()
@@ -279,12 +337,8 @@ def main():
         "crop_origin": "top_left",
     }
 
-    with open(args.run_manifest, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(run_row.keys()))
-        writer.writeheader()
-        writer.writerow(run_row)
-
-    pd.DataFrame(image_rows).to_csv(args.image_manifest, index=False)
+    append_manifest_row(args.run_manifest, run_row)
+    merge_image_manifest(existing_image_manifest, image_rows).to_csv(args.image_manifest, index=False)
 
     print(f"Run ID: {run_id}")
     print(f"Processed images: {len(image_rows)}")

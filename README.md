@@ -99,6 +99,8 @@ cluster_result <- cluster_reduced_embeddings(pca_result$scores, feature_cols = p
 
 For full-dataset processing on HPC, use [scripts/run_all_raw_cellpose.py](./scripts/run_all_raw_cellpose.py). It scans the raw LTEE image directory directly, applies the same top-left crop (`y < 1100`, `x < 1400`), writes segmentation masks and per-image embedding CSVs under `data/all_images/`, and does not save cropped raw images.
 
+The script now treats `data/all_images/manifests/segmentation_images.csv` as the ledger of completed work. Re-running it after the external raw-image directory changes will process only images not already present in that manifest, append a new row to `data/all_images/manifests/segmentation_runs.csv`, and leave prior outputs in place. Use `--overwrite-existing` only when you intentionally want to regenerate previously processed images.
+
 Example direct run:
 
 ```bash
@@ -112,6 +114,14 @@ python scripts/run_all_raw_cellpose.py \
   --cellpose-batch-size 16 \
   --embedding-batch-size 512
 ```
+
+When new external images arrive, the intended update flow is:
+
+1. Rebuild `manifests/image_manifest.csv` and `manifests/image_id_summary.csv` with `R/index_hpc_images.R`.
+2. Re-run `scripts/run_all_raw_cellpose.py` on HPC with the same output locations.
+3. Let the script append only the newly processed images to `data/all_images/manifests/segmentation_images.csv`.
+
+This keeps the repo clean by avoiding ad hoc "new images" folders or one-off manifests. The tracked repo state is still just the code plus the top-level image/index manifests, while the large full-run artifacts remain under ignored `data/all_images/`.
 
 For cluster submission, use [scripts/submit_all_raw_cellpose.slurm](./scripts/submit_all_raw_cellpose.slurm).
 
