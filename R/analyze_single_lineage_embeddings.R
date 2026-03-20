@@ -440,6 +440,19 @@ main <- function() {
     )
   })
   resolved_meta <- data.table::rbindlist(resolved_meta_list, use.names = TRUE, fill = TRUE)
+  resolved_meta_all <- data.table::copy(resolved_meta)
+  duplicate_meta <- resolved_meta_all[, .N, by = .(image_id)][N > 1L]
+  if (nrow(duplicate_meta)) {
+    warning(
+      sprintf(
+        "Collapsing duplicated lineage image metadata for %d image_id values: %s",
+        nrow(duplicate_meta),
+        paste(duplicate_meta$image_id, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+  resolved_meta <- resolved_meta_all[order(image_id, passage_number)][, .SD[1], by = image_id]
 
   missing_embedding <- resolved_meta[is.na(embedding_path) | !nzchar(embedding_path)]
   if (nrow(missing_embedding)) {
@@ -502,9 +515,14 @@ main <- function() {
     lineage_id = args$lineage_id
   )
 
+  image_quantiles <- unique(
+    image_counts[, .(image_id, quantile, cell_count)],
+    by = "image_id"
+  )
+
   object_dt <- merge(
     object_dt,
-    image_counts[, .(image_id, quantile, cell_count)],
+    image_quantiles,
     by = "image_id",
     all.x = TRUE
   )
