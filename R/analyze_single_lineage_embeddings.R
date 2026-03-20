@@ -156,6 +156,40 @@ candidate_embedding_paths <- function(project_root, embedding_dir, image_id, fil
   file.path(embedding_dir, paste0(stem_candidates, "_embeddings.csv"))
 }
 
+match_segmentation_row <- function(seg_dt, row) {
+  seg_row <- NULL
+
+  if ("filename" %in% names(seg_dt) && "filename" %in% names(row)) {
+    seg_row <- seg_dt[filename == row$filename[[1]]]
+    if (nrow(seg_row)) {
+      return(seg_row[1])
+    }
+  }
+
+  if ("source_filepath" %in% names(seg_dt) && "filepath" %in% names(row)) {
+    seg_row <- seg_dt[source_filepath == row$filepath[[1]]]
+    if (nrow(seg_row)) {
+      return(seg_row[1])
+    }
+  }
+
+  if ("source_basename" %in% names(seg_dt) && "filepath" %in% names(row)) {
+    seg_row <- seg_dt[source_basename == basename(row$filepath[[1]])]
+    if (nrow(seg_row)) {
+      return(seg_row[1])
+    }
+  }
+
+  if ("id" %in% names(seg_dt)) {
+    seg_row <- seg_dt[id == row$id[[1]]]
+    if (nrow(seg_row)) {
+      return(seg_row[1])
+    }
+  }
+
+  NULL
+}
+
 read_grayscale_image <- function(path) {
   img <- tiff::readTIFF(path, native = FALSE, all = FALSE)
   dims <- dim(img)
@@ -426,26 +460,17 @@ main <- function() {
   if ("filename" %in% names(seg_dt)) {
     seg_dt[, filename := as.character(filename)]
   }
+  if ("source_filepath" %in% names(seg_dt)) {
+    seg_dt[, source_filepath := as.character(source_filepath)]
+    seg_dt[, source_basename := basename(source_filepath)]
+  }
   for (path_col in intersect(c("raw_relpath", "mask_relpath", "embedding_relpath"), names(seg_dt))) {
     seg_dt[, (path_col) := project_path(project_root, normalize_relpath(get(path_col)))]
   }
 
   resolved_meta_list <- lapply(seq_len(nrow(image_meta)), function(i) {
     row <- image_meta[i]
-    seg_row <- NULL
-
-    if ("filename" %in% names(seg_dt) && "filename" %in% names(row)) {
-      seg_row <- seg_dt[filename == row$filename[[1]]]
-      if (nrow(seg_row)) {
-        seg_row <- seg_row[1]
-      }
-    }
-    if ((is.null(seg_row) || !nrow(seg_row)) && "id" %in% names(seg_dt)) {
-      seg_row <- seg_dt[id == row$id[[1]]]
-      if (nrow(seg_row)) {
-        seg_row <- seg_row[1]
-      }
-    }
+    seg_row <- match_segmentation_row(seg_dt, row)
 
     embedding_path <- NA_character_
     raw_path <- NA_character_
@@ -507,6 +532,21 @@ main <- function() {
       paste(missing_embedding$image_id, collapse = ", ")
     ))
   }
+  missing_raw_mask <- resolved_meta[is.na(raw_relpath) | !nzchar(raw_relpath) | is.na(mask_relpath) | !nzchar(mask_relpath)]
+  if (nrow(missing_raw_mask)) {
+    emit_warning(sprintf(
+      "Missing raw/mask paths for %d lineage images after segmentation-manifest matching: %s",
+      nrow(missing_raw_mask),
+      paste(missing_raw_mask$image_id, collapse = ", ")
+    ))
+  }
+  cat(sprintf(
+    "Resolved image paths: embeddings=%d/%d raw_mask=%d/%d\n",
+    sum(!is.na(resolved_meta$embedding_path) & nzchar(resolved_meta$embedding_path)),
+    nrow(resolved_meta),
+    sum(!is.na(resolved_meta$raw_relpath) & nzchar(resolved_meta$raw_relpath) & !is.na(resolved_meta$mask_relpath) & nzchar(resolved_meta$mask_relpath)),
+    nrow(resolved_meta)
+  ))
 
   embedding_tables <- lapply(seq_len(nrow(resolved_meta)), function(i) {
     row <- resolved_meta[i]
