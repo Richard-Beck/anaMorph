@@ -175,11 +175,23 @@ smooth_series <- function(x) {
   stats::runmed(x, k = k, endrule = "median")
 }
 
+calc_monotonicity <- function(x) {
+  net <- abs(x[[length(x)]] - x[[1]])
+  total <- sum(abs(diff(x)))
+  if (!is.finite(total) || total <= 0) return(0)
+  net / total
+}
+
 lineage_trend_summary <- function(df) {
   df <- df %>% arrange(passage_position)
   n_passages <- nrow(df)
   start_passage_id <- df$passage_id[[1]]
   end_passage_id <- df$passage_id[[n_passages]]
+  matched_passage_fraction <- if ("n_matched_images" %in% names(df)) {
+    mean(df$n_matched_images > 0, na.rm = TRUE)
+  } else {
+    NA_real_
+  }
 
   score_df <- df %>%
     filter(
@@ -193,6 +205,8 @@ lineage_trend_summary <- function(df) {
   if (nrow(score_df) < 3) {
     return(tibble(
       n_passages = n_passages,
+      n_scored_passages = nrow(score_df),
+      matched_passage_fraction = matched_passage_fraction,
       start_passage_id = start_passage_id,
       end_passage_id = end_passage_id,
       smooth_delta_median_z = NA_real_,
@@ -204,7 +218,10 @@ lineage_trend_summary <- function(df) {
       monotonicity_median = NA_real_,
       monotonicity_q99 = NA_real_,
       monotonicity_frac_z_gt_3 = NA_real_,
-      long_term_score = NA_real_
+      long_term_score = NA_real_,
+      trend_class = "Insufficient data",
+      trend_direction = "undetermined",
+      trend_statement = "Fewer than three passages had enough analyzed objects to assess a longitudinal trend."
     ))
   }
 
@@ -212,13 +229,6 @@ lineage_trend_summary <- function(df) {
   iqr_s <- smooth_series(score_df$iqr_z)
   q99_s <- smooth_series(score_df$q99_z)
   frac_s <- smooth_series(score_df$frac_z_gt_3)
-
-  calc_monotonicity <- function(x) {
-    net <- abs(x[[length(x)]] - x[[1]])
-    total <- sum(abs(diff(x)))
-    if (!is.finite(total) || total <= 0) return(0)
-    net / total
-  }
 
   delta_med <- med_s[[length(med_s)]] - med_s[[1]]
   delta_iqr <- iqr_s[[length(iqr_s)]] - iqr_s[[1]]
@@ -238,8 +248,50 @@ lineage_trend_summary <- function(df) {
   consistency_weight <- mean(c(monotonicity_median, monotonicity_q99, monotonicity_frac), na.rm = TRUE)
   long_term_score <- long_term_score_raw * consistency_weight * log1p(n_passages)
 
+  primary_signal <- c(
+    center = abs(delta_med),
+    spread = 0.75 * abs(delta_iqr),
+    tail = max(abs(delta_q99), 4 * abs(delta_frac))
+  )
+  primary_axis <- names(primary_signal)[which.max(primary_signal)]
+  signed_tail <- delta_q99 + 4 * delta_frac
+  signed_center <- delta_med
+  signed_spread <- delta_iqr
+
+  if (!is.finite(long_term_score) || long_term_score < 0.75 || consistency_weight < 0.2) {
+    trend_class <- "No clear long-term trend"
+    trend_direction <- "none"
+    trend_statement <- "No strong, persistent long-term drift is evident once passage-level noise is accounted for."
+  } else if (primary_axis == "tail") {
+    trend_direction <- if (signed_tail >= 0) "larger-tail" else "smaller-tail"
+    trend_class <- if (signed_tail >= 0) "Upper-tail expansion" else "Upper-tail contraction"
+    trend_statement <- sprintf(
+      "%s: the upper tail changes more than the lineage center, suggesting a persistent %s of unusually large cells.",
+      trend_class,
+      if (signed_tail >= 0) "enrichment" else "loss"
+    )
+  } else if (primary_axis == "spread") {
+    trend_direction <- if (signed_spread >= 0) "broader" else "tighter"
+    trend_class <- if (signed_spread >= 0) "Distribution broadening" else "Distribution tightening"
+    trend_statement <- sprintf(
+      "%s: dispersion changes dominate over center shift, indicating the lineage is becoming %s over time.",
+      trend_class,
+      if (signed_spread >= 0) "more heterogeneous" else "more homogeneous"
+    )
+  } else {
+    trend_direction <- if (signed_center >= 0) "larger" else "smaller"
+    trend_class <- if (signed_center >= 0) "Bulk shift upward" else "Bulk shift downward"
+    trend_statement <- sprintf(
+      "%s: the lineage center drifts %s over time, consistent with a broad change in typical cell size rather than only a tail effect.",
+      trend_class,
+      if (signed_center >= 0) "toward larger residuals" else "toward smaller residuals"
+    )
+  }
+
   tibble(
     n_passages = n_passages,
+    n_scored_passages = nrow(score_df),
+    matched_passage_fraction = matched_passage_fraction,
     start_passage_id = start_passage_id,
     end_passage_id = end_passage_id,
     smooth_delta_median_z = delta_med,
@@ -251,8 +303,29 @@ lineage_trend_summary <- function(df) {
     monotonicity_median = monotonicity_median,
     monotonicity_q99 = monotonicity_q99,
     monotonicity_frac_z_gt_3 = monotonicity_frac,
-    long_term_score = long_term_score
+    long_term_score = long_term_score,
+    trend_class = trend_class,
+    trend_direction = trend_direction,
+    trend_statement = trend_statement
   )
+}
+
+choose_representative_passages <- function(df) {
+  score_df <- df %>%
+    filter(
+      is.finite(median_z) |
+      is.finite(iqr_z) |
+      is.finite(q99_z) |
+      is.finite(frac_z_gt_3)
+    ) %>%
+    arrange(passage_position)
+
+  if (!nrow(score_df)) {
+    return(character())
+  }
+
+  idx <- unique(c(1, ceiling(nrow(score_df) / 2), nrow(score_df)))
+  score_df$passage_id[idx]
 }
 ```
 
@@ -310,23 +383,24 @@ all_image_tbl <- purrr::map2_dfr(summary_bundle, analysis_index$analysis_dir, fu
 })
 ```
 
-## Rank The Most Promising Long-Term Lineages
+## Per-Lineage Trend Summary
 
-```{r lineage-ranking}
+```{r lineage-summary}
 lineage_rank_tbl <- all_passage_tbl %>%
   arrange(lineage_id, passage_position) %>%
   group_by(lineage_id) %>%
   group_modify(~ lineage_trend_summary(.x)) %>%
-  ungroup() %>%
-  filter(is.finite(long_term_score)) %>%
-  arrange(desc(long_term_score))
+  ungroup()
 
 top_lineage_tbl <- lineage_rank_tbl %>%
   select(
     lineage_id,
     n_passages,
+    n_scored_passages,
+    matched_passage_fraction,
     start_passage_id,
     end_passage_id,
+    trend_class,
     long_term_score,
     smooth_delta_median_z,
     smooth_delta_iqr_z,
@@ -335,300 +409,208 @@ top_lineage_tbl <- lineage_rank_tbl %>%
     monotonicity_median,
     monotonicity_q99,
     monotonicity_frac_z_gt_3
-  ) %>%
-  slice_head(n = 15)
+  )
 
 knitr::kable(top_lineage_tbl, digits = 3)
 ```
 
 Interpretation:
 
-- `smooth_delta_*` values measure start-to-end change after median smoothing across passages.
-- `monotonicity_*` downweights lineages that only look interesting because of one sharp jump and reversal.
-- `long_term_score` is meant to prioritize persistent drift, especially in the upper tail, rather than single noisy transitions.
+- `trend_class` is the notebook's best high-level description of the long-term behavior in that lineage.
+- `smooth_delta_*` values measure start-to-end change after median smoothing across scored passages.
+- `matched_passage_fraction` shows how much of the manual lineage currently has embedding-derived area data.
 
-## Cross-Lineage Summary Plots
+## Cross-Lineage Overview
 
-```{r lineage-ranking-plot}
-ggplot(
-  lineage_rank_tbl,
-  aes(
-    x = abs(smooth_delta_median_z),
-    y = abs(smooth_delta_q99_z),
-    size = abs(smooth_delta_frac_z_gt_3),
-    color = long_term_score
-  )
-) +
-  geom_point(alpha = 0.8) +
-  geom_text(
-    data = slice_head(lineage_rank_tbl, n = 10),
-    aes(label = lineage_id),
-    nudge_y = 0.03,
-    size = 3,
-    show.legend = FALSE
-  ) +
-  scale_color_gradient(low = "#8ecae6", high = "#d00000") +
-  labs(
-    title = "Which lineages show the strongest long-term distribution drift?",
-    subtitle = "Upper-right lineages change persistently in both center and upper tail",
-    x = "Absolute smoothed start-to-end change in median z",
-    y = "Absolute smoothed start-to-end change in q99 z",
-    size = "Absolute smoothed\nchange in frac(z > 3)",
-    color = "Long-term\nscore"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-```{r top-lineage-heatmap}
-top_lineages <- lineage_rank_tbl %>%
-  slice_head(n = 20) %>%
-  pull(lineage_id)
-
-heatmap_tbl <- all_passage_tbl %>%
-  filter(lineage_id %in% top_lineages) %>%
-  mutate(lineage_id = factor(lineage_id, levels = rev(top_lineages)))
-
-ggplot(heatmap_tbl, aes(x = passage_position, y = lineage_id, fill = median_z)) +
-  geom_tile(color = "white") +
-  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0) +
-  labs(
-    title = "Passage-level median residual across top-ranked lineages",
-    subtitle = "Red passages are larger-than-expected after growth-state adjustment",
-    x = "Passage position",
-    y = "Lineage",
-    fill = "Median z"
-  ) +
-  theme_minimal(base_size = 12)
-```
-
-## Choose A Focus Lineage
-
-```{r choose-focus-lineage}
-best_lineage_tbl <- lineage_rank_tbl %>% slice(1)
-
-focus_lineage_id <- params$lineage_id
-if (is.null(focus_lineage_id) || !nzchar(focus_lineage_id)) {
-  focus_lineage_id <- best_lineage_tbl$lineage_id[[1]]
-}
-
-focus_analysis_dir <- params$analysis_dir
-if (is.null(focus_analysis_dir) || !nzchar(focus_analysis_dir)) {
-  focus_analysis_dir <- analysis_dir_from_id(focus_lineage_id)
-}
-focus_analysis_rds <- file.path(project_path(focus_analysis_dir), "lineage_area_analysis.rds")
-
-focus_obj <- read_analysis_bundle(focus_analysis_rds)
-
-focus_cell_tbl <- focus_obj$cells %>%
-  mutate(
-    lineage_id = as.character(lineage_id),
-    passage_position = as.integer(passage_position),
-    p_small = as.numeric(p_small),
-    p_real = as.numeric(p_real),
-    z = as.numeric(z),
-    log_area = as.numeric(log_area),
-    time_since_passage_start_hours = as.numeric(time_since_passage_start_hours),
-    log_confluence = as.numeric(log_confluence)
-  )
-
-focus_image_tbl <- focus_obj$image_summary %>%
-  mutate(passage_position = as.integer(passage_position))
-
-focus_passage_tbl <- focus_obj$passage_summary %>%
-  mutate(
-    passage_position = as.integer(passage_position),
-    first_image_time = parse_datetime_safe(first_image_time)
+```{r lineage-overview-plot}
+overview_long_tbl <- all_passage_tbl %>%
+  select(lineage_id, passage_position, median_z, iqr_z, q99_z, frac_z_gt_3) %>%
+  pivot_longer(
+    cols = c(median_z, iqr_z, q99_z, frac_z_gt_3),
+    names_to = "metric",
+    values_to = "value"
   ) %>%
-  arrange(passage_position)
+  group_by(lineage_id, metric) %>%
+  arrange(passage_position, .by_group = TRUE) %>%
+  mutate(smooth_value = smooth_series(value)) %>%
+  ungroup()
 
-focus_lineage_rank_tbl <- lineage_rank_tbl %>%
-  filter(lineage_id == focus_lineage_id) %>%
-  slice_head(n = 1)
-
-if (!inherits(focus_lineage_rank_tbl, "data.frame") || nrow(focus_lineage_rank_tbl) == 0) {
-  stop(sprintf("No ranked lineage summary found for lineage %s", focus_lineage_id), call. = FALSE)
-}
-
-focus_summary_tbl <- tibble(
-  focus_lineage_id = focus_lineage_id,
-  start_passage_id = focus_lineage_rank_tbl$start_passage_id[[1]],
-  end_passage_id = focus_lineage_rank_tbl$end_passage_id[[1]],
-  focus_trend = paste0(
-    focus_lineage_rank_tbl$start_passage_id[[1]],
-    " -> ",
-    focus_lineage_rank_tbl$end_passage_id[[1]]
-  ),
-  long_term_score = focus_lineage_rank_tbl$long_term_score[[1]]
-)
-
-knitr::kable(focus_summary_tbl, digits = 3)
-```
-
-## Focus Lineage: Distributional Review
-
-```{r focus-passage-summary}
-focus_display_tbl <- focus_passage_tbl %>%
-  transmute(
-    passage_position,
-    passage_id,
-    n_objects,
-    effective_n = round(effective_n, 1),
-    nuisance_fraction = round(nuisance_fraction, 3),
-    median_z = round(median_z, 3),
-    iqr_z = round(iqr_z, 3),
-    q95_z = round(q95_z, 3),
-    q99_z = round(q99_z, 3),
-    frac_z_gt_2 = round(frac_z_gt_2, 3),
-    frac_z_gt_3 = round(frac_z_gt_3, 3)
-  )
-
-knitr::kable(focus_display_tbl)
-```
-
-```{r focus-center-and-tail}
-focus_long_tbl <- focus_passage_tbl %>%
-  select(passage_position, median_z, iqr_z, q95_z, q99_z, frac_z_gt_3) %>%
-  pivot_longer(cols = -passage_position, names_to = "metric", values_to = "value")
-
-ggplot(focus_long_tbl, aes(x = passage_position, y = value, color = metric)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 2) +
-  geom_vline(xintercept = 1, linetype = "blank") +
+ggplot(overview_long_tbl, aes(x = passage_position, y = value)) +
+  geom_line(color = "grey75", linewidth = 0.5) +
+  geom_point(color = "grey55", size = 1.3) +
+  geom_line(aes(y = smooth_value, color = lineage_id), linewidth = 1) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
   labs(
-    title = paste("Lineage", focus_lineage_id, ": passage-level adjusted distribution summaries"),
-    subtitle = "Use this to judge whether the lineage shows persistent drift rather than a single noisy step",
+    title = "Passage-level trajectories across the three manual lineages",
+    subtitle = "Grey points show raw passage summaries; colored lines show median-smoothed trajectories",
     x = "Passage position",
     y = "Summary value",
+    color = "Lineage"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r lineage-coverage-plot}
+coverage_long_tbl <- all_passage_tbl %>%
+  select(lineage_id, passage_position, n_manifest_images, n_matched_images, n_objects) %>%
+  pivot_longer(
+    cols = c(n_manifest_images, n_matched_images, n_objects),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(coverage_long_tbl, aes(x = passage_position, y = value, color = metric)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ lineage_id, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Data availability along each manual lineage",
+    subtitle = "Use this to distinguish a real flattening of the signal from missing segmentation coverage",
+    x = "Passage position",
+    y = "Count",
     color = "Metric"
   ) +
   theme_minimal(base_size = 12)
 ```
 
-```{r focus-density-panels}
-target_passages <- c(focus_lineage_rank_tbl$start_passage_id[[1]], focus_lineage_rank_tbl$end_passage_id[[1]])
+## Detailed Lineage Review
 
-focus_density_tbl <- focus_cell_tbl %>%
-  filter(passage_id %in% target_passages, is.finite(z), p_real >= 0.5) %>%
-  group_by(passage_id) %>%
-  sample_n(size = min(n(), 5000)) %>%
-  ungroup() %>%
-  mutate(
-    passage_label = paste0("P", passage_position, ": ", passage_id)
-  )
+```{r detailed-lineage-review, results='asis', fig.height=8, fig.width=10}
+bundle_by_id <- stats::setNames(summary_bundle, analysis_index$lineage_id)
 
-ggplot(focus_density_tbl, aes(x = z, fill = passage_label)) +
-  geom_density(alpha = 0.45) +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
-  labs(
-    title = paste("Early vs late residual distributions in lineage", focus_lineage_id),
-    subtitle = "This compares the start and end of the lineage after smoothing-based ranking",
-    x = "Residual z",
-    y = "Density",
-    fill = "Passage"
-  ) +
-  theme_minimal(base_size = 12)
-```
+for (lineage_id in analysis_index$lineage_id) {
+  current_lineage_id <- lineage_id
+  cat("### ", current_lineage_id, "\n\n", sep = "")
 
-```{r focus-image-transition}
-transition_image_tbl <- focus_image_tbl %>%
-  filter(passage_id %in% target_passages) %>%
-  mutate(
-    transition_side = ifelse(passage_id == target_passages[[1]], "early", "late"),
-    image_rank_score = abs(median_z) + abs(q99_z) + 4 * frac_z_gt_3
-  ) %>%
-  arrange(desc(image_rank_score))
-
-n_show_images <- min(nrow(transition_image_tbl), params$max_images)
-
-knitr::kable(
-  transition_image_tbl %>%
-    select(
-      transition_side,
-      passage_position,
-      passage_id,
-      image_id,
-      filename,
-      n_objects,
-      median_z,
-      iqr_z,
-      q99_z,
-      frac_z_gt_3
+  bundle <- bundle_by_id[[current_lineage_id]]
+  passage_tbl <- bundle$passage_summary %>%
+    mutate(
+      passage_position = as.integer(passage_position),
+      first_image_time = parse_datetime_safe(first_image_time)
     ) %>%
-    slice_head(n = n_show_images),
-  digits = 3
-)
-```
+    arrange(passage_position)
+  cell_tbl <- bundle$cells %>%
+    mutate(
+      passage_position = as.integer(passage_position),
+      p_real = as.numeric(p_real),
+      z = as.numeric(z)
+    )
+  summary_row <- lineage_rank_tbl %>% filter(lineage_id == .env$current_lineage_id) %>% slice_head(n = 1)
 
-## Candidate Image Panel
+  cat(summary_row$trend_statement[[1]], "\n\n")
 
-```{r candidate-images, eval=params$show_images}
-if (!requireNamespace("EBImage", quietly = TRUE)) {
-  stop("Install EBImage to render the raw image panel.", call. = FALSE)
-}
-
-manifest_path <- project_path(params$manifest_csv)
-manifest_tbl <- readr::read_csv(manifest_path, show_col_types = FALSE) %>%
-  filter(artifact_type == "raw_image") %>%
-  distinct(filename, filepath, .keep_all = TRUE)
-
-direction_positive <- focus_lineage_rank_tbl$smooth_delta_q99_z[[1]] >= 0
-
-before_tbl <- transition_image_tbl %>%
-  filter(transition_side == "early")
-after_tbl <- transition_image_tbl %>%
-  filter(transition_side == "late")
-
-if (direction_positive) {
-  before_tbl <- before_tbl %>% arrange(median_z)
-  after_tbl <- after_tbl %>% arrange(desc(median_z))
-} else {
-  before_tbl <- before_tbl %>% arrange(desc(median_z))
-  after_tbl <- after_tbl %>% arrange(median_z)
-}
-
-half_n <- max(1, floor(params$max_images / 2))
-candidate_tbl <- bind_rows(
-  before_tbl %>% slice_head(n = half_n),
-  after_tbl %>% slice_head(n = params$max_images - half_n)
-) %>%
-  left_join(manifest_tbl %>% select(filename, filepath), by = "filename") %>%
-  filter(!is.na(filepath))
-
-if (!nrow(candidate_tbl)) {
-  stop("No candidate images could be matched to file paths in the manifest.", call. = FALSE)
-}
-
-knitr::kable(
-  candidate_tbl %>%
+  detail_tbl <- summary_row %>%
     transmute(
-      transition_side,
+      lineage_id,
+      trend_class,
+      n_passages,
+      n_scored_passages,
+      matched_passage_fraction,
+      long_term_score,
+      smooth_delta_median_z,
+      smooth_delta_iqr_z,
+      smooth_delta_q99_z,
+      smooth_delta_frac_z_gt_3,
+      monotonicity_median,
+      monotonicity_q99,
+      monotonicity_frac_z_gt_3
+    )
+  print(knitr::kable(detail_tbl, digits = 3))
+  cat("\n")
+
+  display_tbl <- passage_tbl %>%
+    transmute(
       passage_position,
       passage_id,
-      filename,
+      n_manifest_images,
+      n_matched_images,
+      n_objects,
+      effective_n = round(effective_n, 1),
+      nuisance_fraction = round(nuisance_fraction, 3),
       median_z = round(median_z, 3),
+      iqr_z = round(iqr_z, 3),
       q99_z = round(q99_z, 3),
       frac_z_gt_3 = round(frac_z_gt_3, 3)
     )
-)
+  print(knitr::kable(display_tbl))
+  cat("\n")
 
-img <- EBImage::readImage(candidate_tbl$filepath)
-EBImage::display(img)
+  plot_tbl <- passage_tbl %>%
+    select(passage_position, median_z, iqr_z, q99_z, frac_z_gt_3) %>%
+    pivot_longer(cols = -passage_position, names_to = "metric", values_to = "value") %>%
+    group_by(metric) %>%
+    arrange(passage_position, .by_group = TRUE) %>%
+    mutate(smooth_value = smooth_series(value)) %>%
+    ungroup()
+
+  p_metrics <- ggplot(plot_tbl, aes(x = passage_position, y = value)) +
+    geom_line(color = "grey75", linewidth = 0.5) +
+    geom_point(color = "grey55", size = 1.5) +
+    geom_line(aes(y = smooth_value), color = "#b2182b", linewidth = 1) +
+    facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+    labs(
+      title = paste("Lineage", current_lineage_id, ": passage-level trajectory"),
+      subtitle = "Red line is the median-smoothed trajectory used for trend interpretation",
+      x = "Passage position",
+      y = "Summary value"
+    ) +
+    theme_minimal(base_size = 11)
+  print(p_metrics)
+
+  p_coverage <- passage_tbl %>%
+    select(passage_position, n_manifest_images, n_matched_images, n_objects) %>%
+    pivot_longer(cols = -passage_position, names_to = "metric", values_to = "value") %>%
+    ggplot(aes(x = passage_position, y = value, color = metric)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.8) +
+    labs(
+      title = paste("Lineage", current_lineage_id, ": coverage along the lineage"),
+      subtitle = "This distinguishes biological flattening from missing segmentation coverage",
+      x = "Passage position",
+      y = "Count",
+      color = "Metric"
+    ) +
+    theme_minimal(base_size = 11)
+  print(p_coverage)
+
+  representative_passages <- choose_representative_passages(passage_tbl)
+  density_tbl <- cell_tbl %>%
+    filter(passage_id %in% representative_passages, is.finite(z), p_real >= 0.5) %>%
+    group_by(passage_id) %>%
+    slice_sample(n = min(dplyr::n(), 5000)) %>%
+    ungroup() %>%
+    mutate(
+      passage_label = paste0("P", passage_position, ": ", passage_id),
+      passage_label = factor(passage_label, levels = unique(passage_label))
+    )
+
+  if (nrow(density_tbl)) {
+    p_density <- ggplot(density_tbl, aes(x = z, fill = passage_label)) +
+      geom_density(alpha = 0.4) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+      labs(
+        title = paste("Lineage", current_lineage_id, ": early / middle / late residual densities"),
+        subtitle = "Use this to decide whether the trend reflects center shift, tail shift, or broadening",
+        x = "Residual z",
+        y = "Density",
+        fill = "Passage"
+      ) +
+      theme_minimal(base_size = 11)
+    print(p_density)
+  }
+
+  cat("\n")
+}
 ```
-
-Interpretation:
-
-- The image panel is meant as a reality check, not a formal validation step.
-- If the selected before/after images show obvious segmentation artifacts, focus on nuisance fraction and image-level instability before trusting the transition.
-- If the images show a coherent morphology shift that aligns with the residual summaries, that lineage becomes a strong candidate for deeper follow-up.
 
 ## Reading This Notebook
 
 Use the output in this order:
 
-1. Look at the transition ranking table and scatter to find candidate lineages.
-2. Use the heatmap to see whether a lineage has one abrupt change or a more gradual trajectory.
-3. Inspect the focus-lineage trend plots to see whether the signal is central, broad, or upper-tail-specific.
-4. Check the candidate image panel to decide whether the statistical change is visually credible.
+1. Start with the summary table to see whether each lineage looks like bulk shift, tail expansion/contraction, broadening/tightening, or no clear trend.
+2. Check the overview plots to see whether the three lineages differ in center shift, upper-tail behavior, or dispersion.
+3. For each lineage, inspect the detailed trajectory and coverage panels together before trusting any apparent plateau or jump.
+4. Use the early/mid/late density comparison to decide whether the long-term change is mainly a center shift, a tail effect, or increased heterogeneity.
 
 ## Render
 
