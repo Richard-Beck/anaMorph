@@ -7,7 +7,8 @@ parse_args <- function(args) {
     n_pcs = "20",
     top_corr_pcs = "3",
     top_export_pcs = "5",
-    crops_per_side = "10"
+    crops_per_side = "10",
+    n_cores = "1"
   )
 
   i <- 1
@@ -31,6 +32,7 @@ parse_args <- function(args) {
   parsed$top_corr_pcs <- as.integer(parsed$top_corr_pcs)
   parsed$top_export_pcs <- as.integer(parsed$top_export_pcs)
   parsed$crops_per_side <- as.integer(parsed$crops_per_side)
+  parsed$n_cores <- as.integer(parsed$n_cores)
   parsed
 }
 
@@ -230,23 +232,51 @@ resize_nn <- function(mat, out_height = 96, out_width = 96) {
   mat[y_idx, x_idx, drop = FALSE]
 }
 
-write_crop_png <- function(mat, out_path, out_height = 96L, out_width = 96L) {
-  display_mat <- resize_nn(rescale_crop(mat), out_height, out_width)
+pad_crop <- function(mat, target_height, target_width) {
+  out <- matrix(0, nrow = target_height, ncol = target_width)
+  row_offset <- floor((target_height - nrow(mat)) / 2) + 1L
+  col_offset <- floor((target_width - ncol(mat)) / 2) + 1L
+  out[
+    row_offset:(row_offset + nrow(mat) - 1L),
+    col_offset:(col_offset + ncol(mat) - 1L)
+  ] <- mat
+  out
+}
+
+assemble_crop_panel <- function(crop_mats, ncol_panel = NULL) {
+  if (!length(crop_mats)) {
+    return(NULL)
+  }
+  heights <- vapply(crop_mats, nrow, integer(1))
+  widths <- vapply(crop_mats, ncol, integer(1))
+  target_height <- max(heights)
+  target_width <- max(widths)
+  padded <- lapply(crop_mats, pad_crop, target_height = target_height, target_width = target_width)
+
+  n_tiles <- length(padded)
+  if (is.null(ncol_panel)) {
+    ncol_panel <- ceiling(sqrt(n_tiles))
+  }
+  nrow_panel <- ceiling(n_tiles / ncol_panel)
+  panel <- matrix(0, nrow = nrow_panel * target_height, ncol = ncol_panel * target_width)
+
+  for (i in seq_along(padded)) {
+    row_block <- ((i - 1L) %/% ncol_panel)
+    col_block <- ((i - 1L) %% ncol_panel)
+    row_start <- row_block * target_height + 1L
+    col_start <- col_block * target_width + 1L
+    panel[
+      row_start:(row_start + target_height - 1L),
+      col_start:(col_start + target_width - 1L)
+    ] <- padded[[i]]
+  }
+
+  panel
+}
+
+write_crop_tiff <- function(mat, out_path) {
   ensure_dir(dirname(out_path))
-  grDevices::png(out_path, width = ncol(display_mat), height = nrow(display_mat))
-  op <- graphics::par(mar = c(0, 0, 0, 0))
-  on.exit({
-    graphics::par(op)
-    grDevices::dev.off()
-  }, add = TRUE)
-  graphics::image(
-    x = seq_len(ncol(display_mat)),
-    y = seq_len(nrow(display_mat)),
-    z = t(display_mat[nrow(display_mat):1, , drop = FALSE]),
-    col = grDevices::gray.colors(256, start = 0, end = 1),
-    axes = FALSE,
-    useRaster = TRUE
-  )
+  tiff::writeTIFF(rescale_crop(mat), out_path, bits.per.sample = 8L, compression = "LZW")
 }
 
 extract_object_crop <- function(image, mask, label, min_row, min_col, max_row, max_col) {
@@ -334,7 +364,7 @@ write_pc_summary_files <- function(pca_obj, n_pcs_keep, out_dir) {
   data.table::fwrite(loadings_dt, file.path(out_dir, "pca_loadings.csv"))
 }
 
-write_representative_crops <- function(score_dt, pc_name, out_dir, n_each) {
+write_representative_crops <- function(score_dt, pc_name, out_dir, n_each, n_cores = 1L) {
   required_cols <- c(
     "image_id", "filename", "label", "raw_relpath", "mask_relpath",
     "bbox_min_row", "bbox_min_col", "bbox_max_row", "bbox_max_col", pc_name
@@ -369,11 +399,13 @@ write_representative_crops <- function(score_dt, pc_name, out_dir, n_each) {
 
   export_side <- function(side_dt, side_name) {
     if (!nrow(side_dt)) {
-      return()
+      return(NULL)
     }
 
+    side_dt[, rank_within_side := seq_len(.N)]
     by_image <- split(seq_len(nrow(side_dt)), side_dt$image_id)
-    for (idx in by_image) {
+
+    process_group <- function(idx) {
       group_dt <- side_dt[idx]
       image_path <- group_dt$raw_relpath[[1]]
       mask_path <- group_dt$mask_relpath[[1]]
@@ -386,13 +418,12 @@ write_representative_crops <- function(score_dt, pc_name, out_dir, n_each) {
           image_path,
           mask_path
         ))
-        next
+        return(NULL)
       }
 
       image <- read_grayscale_image(image_path)
       mask <- read_mask_tiff(mask_path)
-
-      for (j in seq_len(nrow(group_dt))) {
+      lapply(seq_len(nrow(group_dt)), function(j) {
         row <- group_dt[j]
         crop <- extract_object_crop(
           image = image,
@@ -403,27 +434,54 @@ write_representative_crops <- function(score_dt, pc_name, out_dir, n_each) {
           max_row = row$bbox_max_row[[1]],
           max_col = row$bbox_max_col[[1]]
         )
-
-        out_name <- sprintf(
-          "%s__rank_%02d__passage_%03d__image_%s__label_%s__score_%0.4f.png",
-          side_name,
-          j,
-          as.integer(row$passage_number[[1]]),
-          gsub("[^A-Za-z0-9._-]", "_", as.character(row$image_id[[1]])),
-          as.character(row$label[[1]]),
-          as.numeric(row[[pc_name]][[1]])
+        list(
+          crop = crop,
+          meta = data.table::data.table(
+            side = side_name,
+            rank = as.integer(row$rank_within_side[[1]]),
+            passage_number = as.integer(row$passage_number[[1]]),
+            image_id = as.character(row$image_id[[1]]),
+            filename = as.character(row$filename[[1]]),
+            label = as.character(row$label[[1]]),
+            score = as.numeric(row[[pc_name]][[1]])
+          )
         )
-        write_crop_png(crop, file.path(out_dir, side_name, out_name))
-      }
+      })
     }
+
+    group_results <- if (.Platform$OS.type == "unix" && n_cores > 1L) {
+      parallel::mclapply(by_image, process_group, mc.cores = min(n_cores, length(by_image)))
+    } else {
+      lapply(by_image, process_group)
+    }
+
+    flat_results <- unlist(group_results, recursive = FALSE, use.names = FALSE)
+    flat_results <- Filter(Negate(is.null), flat_results)
+    if (!length(flat_results)) {
+      emit_warning(sprintf("No crops could be extracted for %s in %s/%s.", pc_name, out_dir, side_name))
+      return(NULL)
+    }
+
+    crop_mats <- lapply(flat_results, `[[`, "crop")
+    meta_dt <- data.table::rbindlist(lapply(flat_results, `[[`, "meta"), use.names = TRUE, fill = TRUE)
+    panel <- assemble_crop_panel(crop_mats)
+    panel_path <- file.path(out_dir, sprintf("%s_panel.tiff", side_name))
+    write_crop_tiff(panel, panel_path)
+    data.table::fwrite(meta_dt, file.path(out_dir, sprintf("%s_panel_metadata.csv", side_name)))
+    meta_dt[, panel_path := panel_path]
+    meta_dt
   }
 
-  export_side(low_dt, "low")
-  export_side(high_dt, "high")
+  low_meta <- export_side(low_dt, "low")
+  high_meta <- export_side(high_dt, "high")
+  combined_meta <- data.table::rbindlist(list(low_meta, high_meta), use.names = TRUE, fill = TRUE)
+  if (nrow(combined_meta)) {
+    data.table::fwrite(combined_meta, file.path(out_dir, "panel_metadata.csv"))
+  }
 }
 
 main <- function() {
-  required_packages <- c("data.table", "ggplot2", "tiff")
+  required_packages <- c("data.table", "ggplot2", "tiff", "parallel")
   missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing_packages) > 0) {
     stop(
@@ -434,6 +492,9 @@ main <- function() {
 
   args <- parse_args(commandArgs(trailingOnly = TRUE))
   project_root <- resolve_project_root()
+  if (!is.finite(args$n_cores) || args$n_cores < 1L) {
+    args$n_cores <- 1L
+  }
 
   lineage_rds <- project_path(project_root, args$lineage_rds)
   segmentation_manifest <- project_path(project_root, args$segmentation_manifest)
@@ -670,22 +731,24 @@ main <- function() {
     top_export_pcs <- head(cor_dt$pc, min(args$top_export_pcs, nrow(cor_dt)))
 
     for (pc_name in top_corr_pcs) {
-      write_representative_crops(
-        score_dt = score_dt,
-        pc_name = pc_name,
-        out_dir = file.path(quantile_out_dir, "top3_abs_correlation", pc_name),
-        n_each = args$crops_per_side
-      )
-    }
+        write_representative_crops(
+          score_dt = score_dt,
+          pc_name = pc_name,
+          out_dir = file.path(quantile_out_dir, "top3_abs_correlation", pc_name),
+          n_each = args$crops_per_side,
+          n_cores = args$n_cores
+        )
+      }
 
     for (pc_name in top_export_pcs) {
-      write_representative_crops(
-        score_dt = score_dt,
-        pc_name = pc_name,
-        out_dir = file.path(quantile_out_dir, "top5_abs_correlation", pc_name),
-        n_each = args$crops_per_side
-      )
-    }
+        write_representative_crops(
+          score_dt = score_dt,
+          pc_name = pc_name,
+          out_dir = file.path(quantile_out_dir, "top5_abs_correlation", pc_name),
+          n_each = args$crops_per_side,
+          n_cores = args$n_cores
+        )
+      }
 
     keep_cols <- c("image_id", "quantile", "label", sprintf("PC_%d", seq_len(args$n_pcs)))
     extra_cols <- intersect(c("filename", "passage_id", "passage_number"), names(score_dt))
@@ -706,6 +769,7 @@ main <- function() {
   cat(sprintf("Lineage: %s\n", args$lineage_id))
   cat(sprintf("Images in lineage: %d\n", nrow(image_counts)))
   cat(sprintf("Cells loaded: %d\n", nrow(object_dt)))
+  cat(sprintf("Crop export cores: %d\n", args$n_cores))
   cat(sprintf("Warnings emitted: %d\n", length(warning_state$messages)))
   if (length(warning_state$messages)) {
     cat(sprintf("Warning log: %s\n", normalize_relpath(warning_state$log_path)))

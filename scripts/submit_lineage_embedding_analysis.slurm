@@ -3,8 +3,8 @@
 #SBATCH --output=logs/lineage_embed_%A_%a.out
 #SBATCH --error=logs/lineage_embed_%A_%a.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=16G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --qos=normal
 #SBATCH --array=1-3
@@ -21,9 +21,9 @@ REPO_ROOT=$(pwd)
 TASK_ID=${SLURM_ARRAY_TASK_ID:-1}
 BINDS="-B ${REPO_ROOT},/home/$USER,/share,/etc/passwd,/etc/group"
 
-export OMP_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 export TZ="US/Eastern"
 export APPTAINER_NOHTTPS=1
 
@@ -39,6 +39,7 @@ echo "Lineage RDS: ${LINEAGE_RDS}"
 echo "Segmentation manifest: ${SEGMENTATION_MANIFEST}"
 echo "Embedding dir: ${EMBEDDING_DIR}"
 echo "Output dir: ${OUT_DIR}"
+echo "CPUs per task: ${SLURM_CPUS_PER_TASK:-16}"
 echo "Container: ${CONTAINER_URI}"
 echo "=========================================================="
 
@@ -53,7 +54,8 @@ apptainer exec ${BINDS} "${CONTAINER_URI}" \
     --lineage_rds "${LINEAGE_RDS}" \
     --segmentation_manifest "${SEGMENTATION_MANIFEST}" \
     --embedding_dir "${EMBEDDING_DIR}" \
-    --out_dir "${OUT_DIR}"
+    --out_dir "${OUT_DIR}" \
+    --n_cores "${SLURM_CPUS_PER_TASK:-16}"
 
 echo "=========================================================="
 echo "Finished lineage ${LINEAGE_ID} at $(date)"
