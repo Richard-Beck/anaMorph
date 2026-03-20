@@ -44,8 +44,7 @@ required_packages <- c(
   "tibble",
   "tidyr",
   "stringr",
-  "scales",
-  "tiff"
+  "scales"
 )
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
@@ -96,12 +95,6 @@ project_path <- function(path) {
   out <- path
   out[!is_absolute] <- file.path(project_root, path[!is_absolute])
   out
-}
-
-ensure_dir <- function(path) {
-  if (!dir.exists(path)) {
-    dir.create(path, recursive = TRUE, showWarnings = FALSE)
-  }
 }
 
 analysis_dir_from_id <- function(lineage_id) {
@@ -161,23 +154,8 @@ plot_grayscale_matrix <- function(img, main = "") {
   title(main = main, cex.main = 0.8)
 }
 
-write_png_from_tiff <- function(raw_path, png_path) {
-  img <- tiff::readTIFF(raw_path, native = FALSE, all = FALSE)
-  display_mat <- normalize_for_display(img)
-  ensure_dir(dirname(png_path))
-  grDevices::png(png_path, width = ncol(display_mat), height = nrow(display_mat))
-  op <- graphics::par(mar = c(0, 0, 0, 0))
-  on.exit({
-    graphics::par(op)
-    grDevices::dev.off()
-  }, add = TRUE)
-  plot_grayscale_matrix(display_mat)
-  invisible(png_path)
-}
-
-cache_lineage_pngs <- function(lineage_id, bundle, manifest_tbl, out_root = "data/lineage_png") {
+get_lineage_pngs <- function(lineage_id, bundle, manifest_tbl, out_root = "data/lineage_png") {
   out_dir <- file.path(project_path(out_root), paste0("lineage_", lineage_id))
-  ensure_dir(out_dir)
 
   png_tbl <- bundle$image_summary %>%
     distinct(filename, .keep_all = TRUE) %>%
@@ -187,14 +165,7 @@ cache_lineage_pngs <- function(lineage_id, bundle, manifest_tbl, out_root = "dat
       raw_path = project_path(filepath),
       png_path = file.path(out_dir, sub("\\.[^.]+$", ".png", basename(filename)))
     )
-
-  missing_idx <- which(!file.exists(png_tbl$png_path) & file.exists(png_tbl$raw_path))
-  if (length(missing_idx)) {
-    for (i in missing_idx) {
-      write_png_from_tiff(png_tbl$raw_path[[i]], png_tbl$png_path[[i]])
-    }
-  }
-
+  png_tbl$png_exists <- file.exists(png_tbl$png_path)
   png_tbl
 }
 
@@ -438,18 +409,39 @@ all_passage_tbl <- all_passage_tbl %>%
   left_join(image_passage_tbl, by = c("lineage_id", "passage_id", "passage_position"))
 ```
 
-## Raw Image PNG Cache
+## Raw Image PNG Availability
 
-```{r cache-lineage-pngs}
+```{r detect-lineage-pngs}
 manifest_path <- project_path(params$manifest_csv)
 manifest_tbl <- readr::read_csv(manifest_path, show_col_types = FALSE) %>%
   filter(artifact_type == "raw_image") %>%
   distinct(filename, filepath, .keep_all = TRUE)
 
 png_index <- purrr::map2(summary_bundle, analysis_index$lineage_id, function(bundle, lineage_id) {
-  cache_lineage_pngs(lineage_id, bundle, manifest_tbl)
+  get_lineage_pngs(lineage_id, bundle, manifest_tbl)
 })
 names(png_index) <- analysis_index$lineage_id
+
+missing_png_tbl <- purrr::imap_dfr(png_index, function(tbl, lineage_id) {
+  tibble(
+    lineage_id = lineage_id,
+    n_raw_images = nrow(tbl),
+    n_png_found = sum(tbl$png_exists, na.rm = TRUE)
+  )
+})
+
+knitr::kable(missing_png_tbl)
+
+if (any(missing_png_tbl$n_png_found < missing_png_tbl$n_raw_images)) {
+  warning(
+    paste(
+      "Some lineage PNGs are missing.",
+      "Run `sbatch scripts/submit_lineage_png_cache.slurm data/lineage_area manifests/image_manifest.csv data/lineage_png`",
+      "to generate them before rendering any image panels."
+    ),
+    call. = FALSE
+  )
+}
 ```
 
 ## Per-Lineage Trend Summary
@@ -667,68 +659,64 @@ for (lineage_id in analysis_index$lineage_id) {
     theme_minimal(base_size = 11)
   print(p_metrics)
 
-  p_coverage <- passage_tbl %>%
-    {
-      detailed_scale <- max(.$n_manifest_images, .$n_matched_images, na.rm = TRUE) /
-        max(c(.$mean_objects_per_image, bundle$image_summary$n_objects), na.rm = TRUE)
-      if (!is.finite(detailed_scale) || detailed_scale <= 0) {
-        detailed_scale <- 1
-      }
+  detailed_scale <- max(passage_tbl$n_manifest_images, passage_tbl$n_matched_images, na.rm = TRUE) /
+    max(c(passage_tbl$mean_objects_per_image, bundle$image_summary$n_objects), na.rm = TRUE)
+  if (!is.finite(detailed_scale) || detailed_scale <= 0) {
+    detailed_scale <- 1
+  }
 
-      count_tbl <- . %>%
-        select(passage_position, n_manifest_images, n_matched_images) %>%
-        pivot_longer(cols = c(n_manifest_images, n_matched_images), names_to = "metric", values_to = "value")
+  detailed_count_tbl <- passage_tbl %>%
+    select(passage_position, n_manifest_images, n_matched_images) %>%
+    pivot_longer(cols = c(n_manifest_images, n_matched_images), names_to = "metric", values_to = "value")
 
-      image_point_tbl <- bundle$image_summary %>%
-        mutate(
-          passage_position = as.integer(passage_position),
-          n_objects = as.numeric(n_objects)
-        )
+  detailed_mean_tbl <- passage_tbl %>%
+    select(passage_position, mean_objects_per_image) %>%
+    mutate(scaled_value = mean_objects_per_image * detailed_scale)
 
-      ggplot() +
-        geom_line(
-          data = count_tbl,
-          aes(x = passage_position, y = value, color = metric),
-          linewidth = 0.9
-        ) +
-        geom_point(
-          data = count_tbl,
-          aes(x = passage_position, y = value, color = metric),
-          size = 1.8
-        ) +
-        geom_line(
-          data = .,
-          aes(
-            x = passage_position,
-            y = mean_objects_per_image * detailed_scale,
-            color = "mean_objects_per_image"
-          ),
-          linewidth = 0.9,
-          linetype = "dashed"
-        ) +
-        geom_point(
-          data = image_point_tbl,
-          aes(
-            x = passage_position,
-            y = n_objects * detailed_scale
-          ),
-          inherit.aes = FALSE,
-          color = "grey35",
-          alpha = 0.55,
-          size = 1.5
-        ) +
-        scale_y_continuous(
-          name = "Images per passage",
-          sec.axis = sec_axis(~ . / detailed_scale, name = "Objects per image")
-        ) +
-        labs(
-          title = paste("Lineage", current_lineage_id, ": coverage along the lineage"),
-          subtitle = "Solid lines show image counts; grey points are per-image object counts; dashed line is the passage mean",
-          x = "Passage position",
-          color = "Metric"
-        ) +
-        theme_minimal(base_size = 11)
-    }
+  image_point_tbl <- bundle$image_summary %>%
+    mutate(
+      passage_position = as.integer(passage_position),
+      n_objects = as.numeric(n_objects),
+      scaled_value = n_objects * detailed_scale
+    )
+
+  p_coverage <- ggplot() +
+    geom_line(
+      data = detailed_count_tbl,
+      aes(x = passage_position, y = value, color = metric),
+      linewidth = 0.9
+    ) +
+    geom_point(
+      data = detailed_count_tbl,
+      aes(x = passage_position, y = value, color = metric),
+      size = 1.8
+    ) +
+    geom_line(
+      data = detailed_mean_tbl,
+      aes(x = passage_position, y = scaled_value),
+      linewidth = 0.9,
+      linetype = "dashed",
+      color = "#b2182b"
+    ) +
+    geom_point(
+      data = image_point_tbl,
+      aes(x = passage_position, y = scaled_value),
+      inherit.aes = FALSE,
+      color = "grey35",
+      alpha = 0.55,
+      size = 1.5
+    ) +
+    scale_y_continuous(
+      name = "Images per passage",
+      sec.axis = sec_axis(~ . / detailed_scale, name = "Objects per image")
+    ) +
+    labs(
+      title = paste("Lineage", current_lineage_id, ": coverage along the lineage"),
+      subtitle = "Solid lines show image counts; grey points are per-image object counts; dashed red line is the passage mean",
+      x = "Passage position",
+      color = "Metric"
+    ) +
+    theme_minimal(base_size = 11)
   print(p_coverage)
 
   representative_passages <- choose_representative_passages(passage_tbl)
