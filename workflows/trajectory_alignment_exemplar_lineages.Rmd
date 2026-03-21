@@ -46,7 +46,7 @@ Evidence against a shared trajectory would look like this:
 
 ## Packages
 
-The core workflow uses standard packages. `uwot` and `princurve` are optional extras for a secondary UMAP view and an optional principal-curve score.
+The core workflow uses standard packages. `uwot` remains optional for a secondary UMAP view.
 
 ```{r packages}
 required_packages <- c(
@@ -82,7 +82,6 @@ library(tibble)
 library(tidyr)
 
 has_uwot <- requireNamespace("uwot", quietly = TRUE)
-has_princurve <- requireNamespace("princurve", quietly = TRUE)
 ```
 
 ## Plot Style
@@ -515,6 +514,58 @@ curvature_diagnostic_tbl <- function(df) {
   }
 
   out
+}
+
+fit_shared_pc12_curve <- function(df, grid_n = 500L) {
+  dat <- df %>%
+    filter(is.finite(PC1), is.finite(PC2), is.finite(time_since_seeding_days))
+
+  if (nrow(dat) < 10 || dplyr::n_distinct(round(dat$PC1, 4)) < 6) {
+    stop("Too few distinct PC1/PC2 points to fit a shared spline trajectory.", call. = FALSE)
+  }
+
+  k_basis <- min(12, max(5, dplyr::n_distinct(round(dat$PC1, 3)) - 1))
+  spline_fit <- mgcv::gam(PC2 ~ s(PC1, k = k_basis), data = dat, method = "REML")
+
+  x_grid <- seq(min(dat$PC1, na.rm = TRUE), max(dat$PC1, na.rm = TRUE), length.out = grid_n)
+  y_grid <- as.numeric(predict(spline_fit, newdata = tibble(PC1 = x_grid)))
+
+  step_len <- c(0, sqrt(diff(x_grid)^2 + diff(y_grid)^2))
+  lambda <- cumsum(step_len)
+
+  grid_tbl <- tibble(
+    PC1 = x_grid,
+    PC2 = y_grid,
+    lambda = lambda
+  )
+
+  nearest_idx <- vapply(seq_len(nrow(dat)), function(i) {
+    which.min((grid_tbl$PC1 - dat$PC1[[i]])^2 + (grid_tbl$PC2 - dat$PC2[[i]])^2)
+  }, integer(1))
+
+  projection_tbl <- dat %>%
+    mutate(
+      curve_PC1 = grid_tbl$PC1[nearest_idx],
+      curve_PC2 = grid_tbl$PC2[nearest_idx],
+      lambda = grid_tbl$lambda[nearest_idx],
+      distance_to_curve = sqrt((PC1 - curve_PC1)^2 + (PC2 - curve_PC2)^2)
+    )
+
+  lambda_cor <- suppressWarnings(cor(projection_tbl$lambda, projection_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman"))
+  if (is.finite(lambda_cor) && lambda_cor < 0) {
+    lambda_max <- max(grid_tbl$lambda, na.rm = TRUE)
+    grid_tbl <- grid_tbl %>%
+      mutate(lambda = lambda_max - lambda) %>%
+      arrange(lambda)
+    projection_tbl <- projection_tbl %>%
+      mutate(lambda = lambda_max - lambda)
+  }
+
+  list(
+    spline_fit = spline_fit,
+    curve_path_tbl = grid_tbl,
+    curve_projection_tbl = projection_tbl
+  )
 }
 ```
 
@@ -1044,17 +1095,15 @@ Interpretation:
 The straight-axis baseline is still useful, but the notebook now defines one explicit main latent variable:
 
 - baseline comparator: oriented `PC1`
-- main latent trajectory: arc length along one shared principal curve fit in `PC1-PC2` across all lineages
+- main latent trajectory: arc length along one shared spline fit in `PC1-PC2` across all lineages
 
-This keeps the trajectory interpretable and visible in the same 2D PCA space used throughout the notebook. `PC3` remains a curvature diagnostic, but the default staging variable is the shared `PC1-PC2` curve score rather than `PC1` alone.
+This keeps the trajectory interpretable and visible in the same 2D PCA space used throughout the notebook. `PC3` remains a curvature diagnostic, but the default staging variable is the shared `PC1-PC2` spline score rather than `PC1` alone.
 
 ```{r latent-score}
 pc1_oriented <- score_tbl$PC1
 if (stats::cor(pc1_oriented, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman") < 0) {
   pc1_oriented <- -pc1_oriented
 }
-
-curve_feature_cols <- c("PC1", "PC2")
 
 latent_tbl <- score_tbl %>%
   mutate(
@@ -1082,84 +1131,50 @@ curve_projection_tbl <- tibble(
   curve_PC1 = numeric(),
   curve_PC2 = numeric(),
   lambda = numeric(),
-  distance_to_curve = numeric()
-)
+    distance_to_curve = numeric()
+  )
 
-if (has_princurve) {
-  curve_input <- as.matrix(score_tbl[, curve_feature_cols])
-  principal_curve_fit <- princurve::principal_curve(curve_input)
+shared_curve_fit <- fit_shared_pc12_curve(score_tbl)
+curve_path_tbl <- shared_curve_fit$curve_path_tbl
+curve_projection_tbl <- shared_curve_fit$curve_projection_tbl
 
-  curve_lambda <- principal_curve_fit$lambda
-  if (stats::cor(curve_lambda, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman") < 0) {
-    curve_lambda <- -curve_lambda
-  }
+path_length_ratio <- sum(sqrt(diff(curve_path_tbl$PC1)^2 + diff(curve_path_tbl$PC2)^2), na.rm = TRUE) /
+  sqrt((max(curve_path_tbl$PC1) - min(curve_path_tbl$PC1))^2 + (curve_path_tbl$PC2[which.max(curve_path_tbl$PC1)] - curve_path_tbl$PC2[which.min(curve_path_tbl$PC1)])^2)
 
-  curve_lambda <- curve_lambda - min(curve_lambda, na.rm = TRUE)
-  curve_lambda01 <- rescale01(curve_lambda)
-  curve_distance <- principal_curve_fit$dist
+curve_vs_pc1 <- stats::cor(rescale01(curve_projection_tbl$lambda), latent_tbl$latent_score_pc1, use = "pairwise.complete.obs", method = "spearman")
+curve_vs_time <- stats::cor(rescale01(curve_projection_tbl$lambda), curve_projection_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman")
 
-  path_length_ratio <- sum(sqrt(rowSums(diff(principal_curve_fit$s[order(curve_lambda), , drop = FALSE])^2)), na.rm = TRUE) /
-    sqrt(sum((principal_curve_fit$s[which.max(curve_lambda), ] - principal_curve_fit$s[which.min(curve_lambda), ])^2))
+curved_trajectory_warranted <- is.finite(path_length_ratio) &&
+  (
+    path_length_ratio > 1.05 ||
+    (("nonlinear_gain_pc2_on_pc1" %in% names(curve_diag_tbl)) && curve_diag_tbl$nonlinear_gain_pc2_on_pc1[[1]] > 0.05)
+  )
 
-  curve_vs_pc1 <- stats::cor(curve_lambda01, latent_tbl$latent_score_pc1, use = "pairwise.complete.obs", method = "spearman")
-  curve_vs_time <- stats::cor(curve_lambda01, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman")
-
-  curved_trajectory_warranted <- is.finite(path_length_ratio) &&
-    (
-      path_length_ratio > 1.08 ||
-      (("nonlinear_gain_pc2_on_pc1" %in% names(curve_diag_tbl)) && curve_diag_tbl$nonlinear_gain_pc2_on_pc1[[1]] > 0.05)
-    )
-
-  latent_tbl <- latent_tbl %>%
-    mutate(
-      latent_score_curve = curve_lambda01,
-      latent_arc_length_curve = curve_lambda,
-      distance_to_curve = curve_distance
-    )
-
-  if (curved_trajectory_warranted) {
-    latent_tbl <- latent_tbl %>%
-      mutate(
-        latent_score = latent_score_curve,
-        latent_arc_length = latent_arc_length_curve,
-        latent_score_method = "shared_principal_curve_arc_length",
-        curve_basis = "PC1 + PC2"
-      )
-  }
-
-  curve_path_tbl <- tibble(
-    PC1 = principal_curve_fit$s[, 1],
-    PC2 = principal_curve_fit$s[, 2],
-    lambda = curve_lambda
+latent_tbl <- latent_tbl %>%
+  left_join(
+    curve_projection_tbl %>%
+      transmute(
+        filename,
+        latent_score_curve = rescale01(lambda),
+        latent_arc_length_curve = lambda,
+        distance_to_curve = distance_to_curve
+      ),
+    by = "filename"
   ) %>%
-    arrange(lambda)
+  mutate(
+    latent_score = latent_score_curve,
+    latent_arc_length = latent_arc_length_curve,
+    latent_score_method = "shared_pc12_spline_arc_length",
+    curve_basis = "PC1 + PC2"
+  )
 
-  curve_projection_tbl <- latent_tbl %>%
-    transmute(
-      filename,
-      lineage_id,
-      PC1,
-      PC2,
-      curve_PC1 = principal_curve_fit$s[, 1],
-      curve_PC2 = principal_curve_fit$s[, 2],
-      lambda = curve_lambda,
-      distance_to_curve = curve_distance
-    )
-
-  curve_diag_tbl <- curve_diag_tbl %>%
-    mutate(
-      path_length_ratio = path_length_ratio,
-      spearman_curve_vs_pc1 = curve_vs_pc1,
-      spearman_curve_vs_time = curve_vs_time,
-      curved_trajectory_warranted = curved_trajectory_warranted
-    )
-} else {
-  latent_tbl <- latent_tbl %>%
-    mutate(
-      latent_score_curve = NA_real_,
-      latent_arc_length_curve = NA_real_
-    )
-}
+curve_diag_tbl <- curve_diag_tbl %>%
+  mutate(
+    path_length_ratio = path_length_ratio,
+    spearman_curve_vs_pc1 = curve_vs_pc1,
+    spearman_curve_vs_time = curve_vs_time,
+    curved_trajectory_warranted = curved_trajectory_warranted
+  )
 
 # Normalize the curve table schema so downstream plots never see a malformed object.
 if (!exists("curve_path_tbl") ||
@@ -1203,12 +1218,12 @@ knitr::kable(curve_diag_tbl, digits = 3)
 Interpretation:
 
 - the main staging variable used below is `latent_tbl$latent_score`
-- if the chosen method is `shared_principal_curve_arc_length`, then every downstream alignment and stage plot is based on distance along one shared curved path in `PC1-PC2`
+- every downstream alignment and stage plot is based on distance along one shared spline path in `PC1-PC2`
 - the main diagnostics to watch are the path-length ratio, the nonlinear gain in `PC2`, and the distance-to-curve distribution
 
 Mapping rule used here:
 
-- each image is projected to the nearest point on the fitted shared curve in `PC1/PC2`
+- each image is projected to the nearest point on a dense fitted shared spline path in `PC1/PC2`
 - `distance_to_curve` is the Euclidean distance from the observed point to that projection
 - `latent_score` is rescaled arc length (`lambda`) of that projected point along the curve
 
@@ -1313,7 +1328,7 @@ if (nrow(distance_plot_tbl) >= 2 && dplyr::n_distinct(distance_plot_tbl$distance
     labs(
       title = "Distance to the fitted curved trajectory",
       subtitle = "Images far from the curve may represent noise, off-trajectory states, or geometry not captured by one path",
-      x = "Distance to principal curve",
+      x = "Distance to shared spline curve",
       y = "Image count"
     )
 } else {
@@ -1324,7 +1339,7 @@ if (nrow(distance_plot_tbl) >= 2 && dplyr::n_distinct(distance_plot_tbl$distance
 Interpretation:
 
 - the curved score is worthwhile when it separates images that `PC1` compresses, especially in the central part of the trajectory
-- a useful principal curve should produce moderate distances for most images rather than fitting only a thin subset of the cloud
+- a useful shared spline curve should produce moderate distances for most images rather than fitting only a thin subset of the cloud
 
 ## Latent Progression Score Versus Time Since Seeding
 
@@ -1844,7 +1859,7 @@ Interpretation:
 This notebook intentionally stops short of a production trajectory model. At this stage, the main outputs to trust are:
 
 1. the curvature diagnostics in `PC1-PC2` and `PC1-PC3`
-2. the principal-curve arc-length score and distance-to-curve diagnostic
+2. the shared `PC1-PC2` spline arc-length score and distance-to-curve diagnostic
 3. the latent-score versus time and density checks
 4. the refined middle-resolving stage bins
 5. the ranked control-image candidate table and highlighted PCA views
