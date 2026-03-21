@@ -342,6 +342,22 @@ choose_representative_passages <- function(df) {
   idx <- unique(c(1, ceiling(nrow(score_df) / 2), nrow(score_df)))
   score_df$passage_id[idx]
 }
+
+build_lineage_timepoint_tbl <- function(bundle) {
+  bundle$cells %>%
+    transmute(
+      lineage_id = as.character(lineage_id),
+      passage_id = as.character(passage_id),
+      passage_position = as.integer(passage_position),
+      image_id = as.character(image_id),
+      image_time = parse_datetime_safe(image_time),
+      time_since_passage_start_days = as.numeric(time_since_passage_start_hours) / 24
+    ) %>%
+    distinct(lineage_id, passage_id, passage_position, image_id, image_time, time_since_passage_start_days) %>%
+    filter(is.finite(time_since_passage_start_days)) %>%
+    count(lineage_id, passage_id, passage_position, time_since_passage_start_days, name = "n_images") %>%
+    arrange(passage_position, time_since_passage_start_days)
+}
 ```
 
 ## Discover Analysis Outputs
@@ -407,6 +423,8 @@ image_passage_tbl <- all_image_tbl %>%
 
 all_passage_tbl <- all_passage_tbl %>%
   left_join(image_passage_tbl, by = c("lineage_id", "passage_id", "passage_position"))
+
+all_timepoint_tbl <- purrr::map_dfr(summary_bundle, build_lineage_timepoint_tbl)
 ```
 
 ## Raw Image PNG Availability
@@ -718,6 +736,34 @@ for (lineage_id in analysis_index$lineage_id) {
     ) +
     theme_minimal(base_size = 11)
   print(p_coverage)
+
+  timepoint_tbl <- all_timepoint_tbl %>%
+    filter(lineage_id == .env$current_lineage_id) %>%
+    mutate(
+      passage_label = paste0("P", passage_position, ": ", passage_id),
+      passage_label = factor(
+        passage_label,
+        levels = rev(unique(paste0("P", passage_position, ": ", passage_id)))
+      )
+    )
+
+  if (nrow(timepoint_tbl)) {
+    p_timepoints <- ggplot(
+      timepoint_tbl,
+      aes(x = time_since_passage_start_days, y = passage_label)
+    ) +
+      geom_point(aes(size = n_images), color = "#2166ac", alpha = 0.85) +
+      scale_size_continuous(range = c(2.2, 5), breaks = pretty_breaks()) +
+      labs(
+        title = paste("Lineage", current_lineage_id, ": image timepoint availability"),
+        subtitle = "Each point is a timepoint within a passage, measured in days since that passage's first image",
+        x = "Days since first image in passage",
+        y = "Passage",
+        size = "Images"
+      ) +
+      theme_minimal(base_size = 11)
+    print(p_timepoints)
+  }
 
   representative_passages <- choose_representative_passages(passage_tbl)
   density_tbl <- cell_tbl %>%
