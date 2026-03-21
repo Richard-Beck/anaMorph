@@ -524,8 +524,9 @@ fit_shared_pc12_curve <- function(df, grid_n = 500L) {
     stop("Too few distinct PC1/PC2 points to fit a shared spline trajectory.", call. = FALSE)
   }
 
-  k_basis <- min(12, max(5, dplyr::n_distinct(round(dat$PC1, 3)) - 1))
-  spline_fit <- mgcv::gam(PC2 ~ s(PC1, k = k_basis), data = dat, method = "REML")
+  # Keep the shared trajectory deliberately smooth to avoid overfitting local sampling density.
+  k_basis <- min(7, max(4, floor(dplyr::n_distinct(round(dat$PC1, 3)) / 6)))
+  spline_fit <- mgcv::gam(PC2 ~ s(PC1, k = k_basis, bs = "cr"), data = dat, method = "REML")
 
   x_grid <- seq(min(dat$PC1, na.rm = TRUE), max(dat$PC1, na.rm = TRUE), length.out = grid_n)
   y_grid <- as.numeric(predict(spline_fit, newdata = tibble(PC1 = x_grid)))
@@ -1292,30 +1293,6 @@ if (nrow(curve_path_tbl) >= 2 && nrow(projection_plot_tbl) >= 1) {
 }
 ```
 
-## Straight-Axis Versus Curved Progression
-
-This section makes the comparison explicit rather than assuming the curve is automatically better.
-
-```{r straight-vs-curved}
-latent_compare_long <- latent_tbl %>%
-  select(lineage_id, time_since_seeding_days, latent_score_pc1, latent_score_curve, distance_to_curve) %>%
-  pivot_longer(cols = c(latent_score_pc1, latent_score_curve), names_to = "score_type", values_to = "score") %>%
-  filter(is.finite(score))
-
-ggplot(latent_compare_long, aes(x = time_since_seeding_days, y = score, color = lineage_id)) +
-  geom_point(alpha = 0.65, size = 1.8) +
-  geom_smooth(se = FALSE, method = "gam", formula = y ~ s(x, k = 6), linewidth = 0.85) +
-  facet_wrap(~ score_type, scales = "free_y") +
-  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
-  labs(
-    title = "Straight-axis versus curved latent progression",
-    subtitle = "Use this to judge whether the curved score resolves structure that PC1 compresses",
-    x = "Time since seeding (days)",
-    y = "Latent score",
-    color = "Lineage"
-  )
-```
-
 ```{r distance-to-curve}
 distance_plot_tbl <- latent_tbl %>%
   filter(is.finite(distance_to_curve))
@@ -1338,7 +1315,7 @@ if (nrow(distance_plot_tbl) >= 2 && dplyr::n_distinct(distance_plot_tbl$distance
 
 Interpretation:
 
-- the curved score is worthwhile when it separates images that `PC1` compresses, especially in the central part of the trajectory
+- the main thing to trust here is the geometry of the shared curve and the projection diagnostic above
 - a useful shared spline curve should produce moderate distances for most images rather than fitting only a thin subset of the cloud
 
 ## Latent Progression Score Versus Time Since Seeding
