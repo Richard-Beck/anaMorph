@@ -344,14 +344,30 @@ choose_representative_passages <- function(df) {
 }
 
 build_lineage_timepoint_tbl <- function(bundle) {
+  flatten_scalar_chr <- function(x) {
+    if (!is.list(x)) return(as.character(x))
+    vapply(x, function(value) {
+      if (!length(value) || all(is.na(value))) return(NA_character_)
+      as.character(value[[1]])
+    }, character(1))
+  }
+
+  flatten_scalar_num <- function(x) {
+    if (!is.list(x)) return(as.numeric(x))
+    vapply(x, function(value) {
+      if (!length(value) || all(is.na(value))) return(NA_real_)
+      suppressWarnings(as.numeric(value[[1]]))
+    }, numeric(1))
+  }
+
   bundle$cells %>%
     transmute(
-      lineage_id = as.character(lineage_id),
-      passage_id = as.character(passage_id),
-      passage_position = as.integer(passage_position),
-      image_id = as.character(image_id),
-      image_time = parse_datetime_safe(image_time),
-      time_since_passage_start_days = as.numeric(time_since_passage_start_hours) / 24
+      lineage_id = flatten_scalar_chr(lineage_id),
+      passage_id = flatten_scalar_chr(passage_id),
+      passage_position = suppressWarnings(as.integer(flatten_scalar_num(passage_position))),
+      image_id = flatten_scalar_chr(image_id),
+      image_time = parse_datetime_safe(flatten_scalar_chr(image_time)),
+      time_since_passage_start_days = flatten_scalar_num(time_since_passage_start_hours) / 24
     ) %>%
     distinct(lineage_id, passage_id, passage_position, image_id, image_time, time_since_passage_start_days) %>%
     filter(is.finite(time_since_passage_start_days)) %>%
