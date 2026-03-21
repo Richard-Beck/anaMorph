@@ -5,11 +5,10 @@ parse_args <- function(args) {
     segmentation_manifest = "data/all_images/manifests/segmentation_images.csv",
     embedding_dir = "data/all_images/embeddings",
     out_dir = "data/lineage_embedding_clusters",
-    k_max = "20",
+    fixed_k = "20",
     nstart = "20",
     representative_cells = "12",
-    n_cores = "1",
-    max_metric_cells = "5000"
+    n_cores = "1"
   )
 
   i <- 1
@@ -29,11 +28,10 @@ parse_args <- function(args) {
     stop("Missing required arg: --lineage_id", call. = FALSE)
   }
 
-  parsed$k_max <- as.integer(parsed$k_max)
+  parsed$fixed_k <- as.integer(parsed$fixed_k)
   parsed$nstart <- as.integer(parsed$nstart)
   parsed$representative_cells <- as.integer(parsed$representative_cells)
   parsed$n_cores <- as.integer(parsed$n_cores)
-  parsed$max_metric_cells <- as.integer(parsed$max_metric_cells)
   parsed
 }
 
@@ -199,9 +197,23 @@ assemble_crop_panel <- function(crop_mats, ncol_panel = NULL) {
   panel
 }
 
-write_crop_tiff <- function(mat, out_path) {
+write_crop_png <- function(mat, out_path) {
   ensure_dir(dirname(out_path))
-  tiff::writeTIFF(rescale_crop(mat), out_path, bits.per.sample = 8L, compression = "LZW")
+  display_mat <- rescale_crop(mat)
+  grDevices::png(out_path, width = ncol(display_mat), height = nrow(display_mat))
+  op <- graphics::par(mar = c(0, 0, 0, 0))
+  on.exit({
+    graphics::par(op)
+    grDevices::dev.off()
+  }, add = TRUE)
+  graphics::image(
+    x = seq_len(ncol(display_mat)),
+    y = seq_len(nrow(display_mat)),
+    z = t(display_mat[nrow(display_mat):1, , drop = FALSE]),
+    col = grDevices::gray.colors(256, start = 0, end = 1),
+    axes = FALSE,
+    useRaster = TRUE
+  )
 }
 
 extract_object_crop <- function(image, mask, label, min_row, min_col, max_row, max_col) {
@@ -213,7 +225,7 @@ extract_object_crop <- function(image, mask, label, min_row, min_col, max_row, m
   crop
 }
 
-evaluate_k_grid <- function(dt, feature_cols, k_max, nstart, seed = 1L, max_metric_cells = 5000L) {
+fit_fixed_kmeans <- function(dt, feature_cols, fixed_k, nstart, seed = 1L) {
   feature_mat <- as.matrix(dt[, ..feature_cols])
   storage.mode(feature_mat) <- "double"
   keep_rows <- stats::complete.cases(feature_mat)
@@ -225,47 +237,13 @@ evaluate_k_grid <- function(dt, feature_cols, k_max, nstart, seed = 1L, max_metr
     stop("Need at least three complete rows for clustering.", call. = FALSE)
   }
 
-  candidate_ks <- seq.int(2L, min(as.integer(k_max), n_obs - 1L))
-  if (!length(candidate_ks)) {
-    stop("No valid cluster counts available.", call. = FALSE)
+  fixed_k <- min(as.integer(fixed_k), n_obs - 1L)
+  if (!is.finite(fixed_k) || fixed_k < 2L) {
+    stop("No valid fixed cluster count available.", call. = FALSE)
   }
 
-  metric_idx <- seq_len(n_obs)
-  if (n_obs > max_metric_cells) {
-    set.seed(seed)
-    metric_idx <- sort(sample.int(n_obs, size = max_metric_cells, replace = FALSE))
-  }
-  metric_mat <- filtered_mat[metric_idx, , drop = FALSE]
-  metric_n <- nrow(metric_mat)
-  dist_mat <- stats::dist(metric_mat)
-  eval_list <- lapply(candidate_ks, function(k) {
-    set.seed(seed)
-    km <- stats::kmeans(metric_mat, centers = k, nstart = nstart)
-    sil <- cluster::silhouette(km$cluster, dist_mat)
-    mean_sil <- mean(sil[, "sil_width"])
-    ch <- (km$betweenss / (k - 1)) / (km$tot.withinss / (metric_n - k))
-    list(
-      k = k,
-      model = km,
-      mean_silhouette = mean_sil,
-      calinski_harabasz = ch,
-      tot_withinss = km$tot.withinss
-    )
-  })
-
-  metrics_dt <- data.table::rbindlist(lapply(eval_list, function(x) {
-    data.table::data.table(
-      k = x$k,
-      mean_silhouette = x$mean_silhouette,
-      calinski_harabasz = x$calinski_harabasz,
-      tot_withinss = x$tot_withinss
-    )
-  }))
-
-  best_idx <- which.max(metrics_dt$mean_silhouette)
-  best_result <- eval_list[[best_idx]]
   set.seed(seed)
-  final_model <- stats::kmeans(filtered_mat, centers = best_result$k, nstart = nstart)
+  final_model <- stats::kmeans(filtered_mat, centers = fixed_k, nstart = nstart)
   centers <- final_model$centers[final_model$cluster, , drop = FALSE]
   cluster_distance <- sqrt(rowSums((filtered_mat - centers) ^ 2))
 
@@ -274,31 +252,12 @@ evaluate_k_grid <- function(dt, feature_cols, k_max, nstart, seed = 1L, max_metr
   clustered_dt[, cluster_distance := cluster_distance]
 
   list(
-    metrics = metrics_dt,
     clustered_tbl = clustered_dt,
-    best_k = best_result$k,
+    best_k = fixed_k,
     best_model = final_model,
     feature_cols = feature_cols,
-    metric_cells = metric_n,
     clustered_cells = n_obs
   )
-}
-
-plot_metric_grid <- function(metrics_dt, title) {
-  plot_dt <- data.table::melt(
-    data.table::copy(metrics_dt),
-    id.vars = "k",
-    measure.vars = c("mean_silhouette", "calinski_harabasz", "tot_withinss"),
-    variable.name = "metric",
-    value.name = "value"
-  )
-
-  ggplot2::ggplot(plot_dt, ggplot2::aes(x = k, y = value)) +
-    ggplot2::geom_line(linewidth = 0.8) +
-    ggplot2::geom_point(size = 1.6) +
-    ggplot2::facet_wrap(~ metric, scales = "free_y", ncol = 1) +
-    ggplot2::theme_bw(base_size = 11) +
-    ggplot2::labs(title = title, x = "Number of clusters", y = "Metric value")
 }
 
 build_cluster_frequency <- function(clustered_dt) {
@@ -313,6 +272,7 @@ plot_cluster_frequency <- function(freq_dt, title) {
   ggplot2::ggplot(freq_dt, ggplot2::aes(x = passage_number, y = relative_frequency, color = cluster)) +
     ggplot2::geom_line(linewidth = 0.8) +
     ggplot2::geom_point(size = 1.2) +
+    ggplot2::scale_y_sqrt() +
     ggplot2::theme_bw(base_size = 11) +
     ggplot2::labs(title = title, x = "Passage number", y = "Relative cluster frequency")
 }
@@ -484,8 +444,8 @@ write_cluster_panels <- function(clustered_dt, crop_meta_dt, out_dir, n_each, n_
     panel <- assemble_crop_panel(crop_mats)
     cluster_dir <- file.path(out_dir, sprintf("cluster_%s", cluster_id))
     ensure_dir(cluster_dir)
-    panel_path <- file.path(cluster_dir, "representative_cells.tiff")
-    write_crop_tiff(panel, panel_path)
+    panel_path <- file.path(cluster_dir, "representative_cells.png")
+    write_crop_png(panel, panel_path)
 
     meta_dt <- data.table::rbindlist(lapply(flat_results, `[[`, "meta"), use.names = TRUE, fill = TRUE)
     meta_dt[, panel_path := panel_path]
@@ -499,19 +459,14 @@ write_cluster_panels <- function(clustered_dt, crop_meta_dt, out_dir, n_each, n_
   }
 }
 
-run_scope_clustering <- function(scope_name, score_dt, feature_cols, crop_meta_dt, out_dir, k_max, nstart, representative_cells, n_cores, max_metric_cells) {
+run_scope_clustering <- function(scope_name, score_dt, feature_cols, crop_meta_dt, out_dir, fixed_k, nstart, representative_cells, n_cores) {
   ensure_dir(out_dir)
-  result <- evaluate_k_grid(
+  result <- fit_fixed_kmeans(
     score_dt,
     feature_cols,
-    k_max = k_max,
-    nstart = nstart,
-    max_metric_cells = max_metric_cells
+    fixed_k = fixed_k,
+    nstart = nstart
   )
-
-  data.table::fwrite(result$metrics, file.path(out_dir, "clustering_metrics.csv"))
-  metric_plot <- plot_metric_grid(result$metrics, sprintf("%s clustering metrics", scope_name))
-  ggplot2::ggsave(file.path(out_dir, "clustering_metrics.png"), metric_plot, width = 8, height = 8, dpi = 150)
 
   clustered_dt <- data.table::copy(result$clustered_tbl)
   data.table::fwrite(clustered_dt, file.path(out_dir, "best_clustering.csv"))
@@ -534,14 +489,12 @@ run_scope_clustering <- function(scope_name, score_dt, feature_cols, crop_meta_d
 
   list(
     best_k = result$best_k,
-    n_cells = nrow(clustered_dt),
-    metrics = result$metrics,
-    metric_cells = result$metric_cells
+    n_cells = nrow(clustered_dt)
   )
 }
 
 main <- function() {
-  required_packages <- c("data.table", "ggplot2", "cluster", "parallel", "tiff")
+  required_packages <- c("data.table", "ggplot2", "parallel", "tiff")
   missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing_packages) > 0) {
     stop(
@@ -553,7 +506,6 @@ main <- function() {
   args <- parse_args(commandArgs(trailingOnly = TRUE))
   project_root <- resolve_project_root()
   if (!is.finite(args$n_cores) || args$n_cores < 1L) args$n_cores <- 1L
-  if (!is.finite(args$max_metric_cells) || args$max_metric_cells < 100L) args$max_metric_cells <- 5000L
 
   lineage_rds <- project_path(project_root, args$lineage_rds)
   lineage_scores_dir <- file.path(project_path(project_root, args$lineage_scores_dir), paste0("lineage_", args$lineage_id))
@@ -621,11 +573,10 @@ main <- function() {
     feature_cols = feature_cols,
     crop_meta_dt = crop_meta_dt,
     out_dir = pooled_out_dir,
-    k_max = args$k_max,
+    fixed_k = args$fixed_k,
     nstart = args$nstart,
     representative_cells = args$representative_cells,
-    n_cores = args$n_cores,
-    max_metric_cells = args$max_metric_cells
+    n_cores = args$n_cores
   )
 
   for (quantile_name in sort(unique(stats::na.omit(score_dt$quantile)))) {
@@ -640,29 +591,27 @@ main <- function() {
       feature_cols = feature_cols,
       crop_meta_dt = crop_meta_dt,
       out_dir = file.path(out_dir, quantile_name),
-      k_max = args$k_max,
+      fixed_k = args$fixed_k,
       nstart = args$nstart,
       representative_cells = args$representative_cells,
-      n_cores = args$n_cores,
-      max_metric_cells = args$max_metric_cells
+      n_cores = args$n_cores
     )
   }
 
   summary_dt <- data.table::rbindlist(lapply(names(cluster_summaries), function(scope_name) {
-    x <- cluster_summaries[[scope_name]]
-    data.table::data.table(
-      scope = scope_name,
-      best_k = x$best_k,
-      n_cells = x$n_cells,
-      metric_cells = x$metric_cells
-    )
-  }), use.names = TRUE, fill = TRUE)
+      x <- cluster_summaries[[scope_name]]
+      data.table::data.table(
+        scope = scope_name,
+        best_k = x$best_k,
+        n_cells = x$n_cells
+      )
+    }), use.names = TRUE, fill = TRUE)
   data.table::fwrite(summary_dt, file.path(out_dir, "clustering_summary.csv"))
 
   cat(sprintf("Lineage: %s\n", args$lineage_id))
   cat(sprintf("Cells available for clustering: %d\n", nrow(score_dt)))
   cat(sprintf("PC features used: %d\n", length(feature_cols)))
-  cat(sprintf("Metric evaluation cells (max): %d\n", args$max_metric_cells))
+  cat(sprintf("Fixed clusters requested: %d\n", args$fixed_k))
   cat(sprintf("Crop export cores: %d\n", args$n_cores))
   cat(sprintf("Warnings emitted: %d\n", length(warning_state$messages)))
   if (length(warning_state$messages)) {

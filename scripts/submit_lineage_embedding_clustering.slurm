@@ -17,6 +17,7 @@ SEGMENTATION_MANIFEST=${3:-"data/all_images/manifests/segmentation_images.csv"}
 EMBEDDING_DIR=${4:-"data/all_images/embeddings"}
 OUT_DIR=${5:-"data/lineage_embedding_clusters"}
 CONTAINER_URI=${6:-"docker://dockerhub.moffitt.org/hpc/rocker-rstudio:4.4.2"}
+FIXED_K=${7:-"20"}
 
 REPO_ROOT=$(pwd)
 TASK_ID=${SLURM_ARRAY_TASK_ID:-1}
@@ -41,6 +42,7 @@ echo "Lineage scores dir: ${LINEAGE_SCORES_DIR}"
 echo "Segmentation manifest: ${SEGMENTATION_MANIFEST}"
 echo "Embedding dir: ${EMBEDDING_DIR}"
 echo "Output dir: ${OUT_DIR}"
+echo "Fixed clusters: ${FIXED_K}"
 echo "CPUs per task: ${SLURM_CPUS_PER_TASK:-16}"
 echo "Container: ${CONTAINER_URI}"
 echo "=========================================================="
@@ -58,6 +60,7 @@ apptainer exec ${BINDS} "${CONTAINER_URI}" \
     --segmentation_manifest "${SEGMENTATION_MANIFEST}" \
     --embedding_dir "${EMBEDDING_DIR}" \
     --out_dir "${OUT_DIR}" \
+    --fixed_k "${FIXED_K}" \
     --n_cores "${SLURM_CPUS_PER_TASK:-16}"
 
 echo "=========================================================="
