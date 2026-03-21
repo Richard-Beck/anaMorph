@@ -1069,7 +1069,11 @@ latent_tbl <- score_tbl %>%
 curve_diag_tbl <- curve_diag_tbl %>%
   mutate(curved_trajectory_warranted = FALSE)
 
-curve_path_tbl <- tibble()
+curve_path_tbl <- tibble(
+  PC1 = numeric(),
+  PC2 = numeric(),
+  lambda = numeric()
+)
 
 if (has_princurve) {
   curve_input <- as.matrix(score_tbl[, curve_feature_cols])
