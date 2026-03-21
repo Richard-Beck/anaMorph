@@ -369,10 +369,10 @@ build_lineage_timepoint_tbl <- function(bundle) {
       image_time = parse_datetime_safe(flatten_scalar_chr(image_time)),
       time_since_passage_start_days = flatten_scalar_num(time_since_passage_start_hours) / 24
     ) %>%
-    distinct(lineage_id, passage_id, passage_position, image_id, image_time, time_since_passage_start_days) %>%
-    filter(is.finite(time_since_passage_start_days)) %>%
-    count(lineage_id, passage_id, passage_position, time_since_passage_start_days, name = "n_images") %>%
-    arrange(passage_position, time_since_passage_start_days)
+    dplyr::distinct(lineage_id, passage_id, passage_position, image_id, image_time, time_since_passage_start_days) %>%
+    dplyr::filter(is.finite(time_since_passage_start_days)) %>%
+    dplyr::count(lineage_id, passage_id, passage_position, time_since_passage_start_days, name = "n_images") %>%
+    dplyr::arrange(passage_position, time_since_passage_start_days)
 }
 ```
 
