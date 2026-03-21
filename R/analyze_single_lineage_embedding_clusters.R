@@ -371,7 +371,6 @@ write_cluster_panels <- function(clustered_dt, crop_meta_dt, out_dir, n_each, n_
   }
 
   cluster_levels <- sort(unique(as.character(merged_dt$cluster)))
-  summary_rows <- list()
 
   for (cluster_id in cluster_levels) {
     cluster_dt <- merged_dt[cluster == cluster_id & !is.na(raw_relpath) & nzchar(raw_relpath) & !is.na(mask_relpath) & nzchar(mask_relpath)]
@@ -442,20 +441,9 @@ write_cluster_panels <- function(clustered_dt, crop_meta_dt, out_dir, n_each, n_
 
     crop_mats <- lapply(flat_results, `[[`, "crop")
     panel <- assemble_crop_panel(crop_mats)
-    cluster_dir <- file.path(out_dir, sprintf("cluster_%s", cluster_id))
-    ensure_dir(cluster_dir)
-    panel_path <- file.path(cluster_dir, "representative_cells.png")
+    ensure_dir(out_dir)
+    panel_path <- file.path(out_dir, sprintf("cluster_%s.png", cluster_id))
     write_crop_png(panel, panel_path)
-
-    meta_dt <- data.table::rbindlist(lapply(flat_results, `[[`, "meta"), use.names = TRUE, fill = TRUE)
-    meta_dt[, panel_path := panel_path]
-    data.table::fwrite(meta_dt, file.path(cluster_dir, "representative_cells.csv"))
-    summary_rows[[cluster_id]] <- meta_dt
-  }
-
-  summary_dt <- data.table::rbindlist(summary_rows, use.names = TRUE, fill = TRUE)
-  if (nrow(summary_dt)) {
-    data.table::fwrite(summary_dt, file.path(out_dir, "cluster_representative_cells.csv"))
   }
 }
 
