@@ -1164,16 +1164,23 @@ ggplot(latent_compare_long, aes(x = time_since_seeding_days, y = score, color = 
 ```
 
 ```{r distance-to-curve}
-ggplot(latent_tbl, aes(x = distance_to_curve, fill = lineage_id)) +
-  geom_histogram(alpha = 0.45, position = "identity", bins = 30) +
-  facet_wrap(~ lineage_id, scales = "free_y", ncol = 1) +
-  scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)], guide = "none") +
-  labs(
-    title = "Distance to the fitted curved trajectory",
-    subtitle = "Images far from the curve may represent noise, off-trajectory states, or geometry not captured by one path",
-    x = "Distance to principal curve",
-    y = "Image count"
-  )
+distance_plot_tbl <- latent_tbl %>%
+  filter(is.finite(distance_to_curve))
+
+if (nrow(distance_plot_tbl) >= 2 && dplyr::n_distinct(distance_plot_tbl$distance_to_curve) >= 2) {
+  ggplot(distance_plot_tbl, aes(x = distance_to_curve, fill = lineage_id)) +
+    geom_histogram(alpha = 0.45, position = "identity", bins = 30) +
+    facet_wrap(~ lineage_id, scales = "free_y", ncol = 1) +
+    scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)], guide = "none") +
+    labs(
+      title = "Distance to the fitted curved trajectory",
+      subtitle = "Images far from the curve may represent noise, off-trajectory states, or geometry not captured by one path",
+      x = "Distance to principal curve",
+      y = "Image count"
+    )
+} else {
+  cat("Distance-to-curve histogram skipped because there are too few finite distinct values to bin safely.\n")
+}
 ```
 
 Interpretation:
@@ -1236,16 +1243,23 @@ Interpretation:
 This view makes the sparse-versus-dense sampling problem explicit. It is especially useful for asking whether the control lineage contributes images to the middle of the shared trajectory rather than only the endpoints.
 
 ```{r latent-density-by-lineage}
-ggplot(latent_tbl, aes(x = latent_score, fill = lineage_id)) +
-  geom_density(alpha = 0.4) +
-  facet_wrap(~ lineage_id, ncol = 1) +
-  scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)], guide = "none") +
-  labs(
-    title = "Lineage occupancy along the latent trajectory",
-    subtitle = "A useful curved trajectory should make the intermediate region visible rather than collapsing it into endpoint bins",
-    x = "Latent progression score",
-    y = "Density"
-  )
+latent_density_tbl <- latent_tbl %>%
+  filter(is.finite(latent_score))
+
+if (nrow(latent_density_tbl) >= 2 && dplyr::n_distinct(latent_density_tbl$latent_score) >= 2) {
+  ggplot(latent_density_tbl, aes(x = latent_score, fill = lineage_id)) +
+    geom_density(alpha = 0.4) +
+    facet_wrap(~ lineage_id, ncol = 1) +
+    scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)], guide = "none") +
+    labs(
+      title = "Lineage occupancy along the latent trajectory",
+      subtitle = "A useful curved trajectory should make the intermediate region visible rather than collapsing it into endpoint bins",
+      x = "Latent progression score",
+      y = "Density"
+    )
+} else {
+  cat("Latent-score density plot skipped because there are too few finite distinct values for a stable density estimate.\n")
+}
 ```
 
 ## Does Temporal Structure Remain After Density Adjustment?
