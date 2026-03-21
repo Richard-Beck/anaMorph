@@ -125,6 +125,22 @@ This keeps the repo clean by avoiding ad hoc "new images" folders or one-off man
 
 For cluster submission, use [scripts/submit_all_raw_cellpose.slurm](./scripts/submit_all_raw_cellpose.slurm).
 
+To generate one cropped-image embedding vector per raw image without running segmentation, use [scripts/run_all_raw_image_embeddings.py](./scripts/run_all_raw_image_embeddings.py). It scans the same raw LTEE directory, applies the same top-left crop (`y < 1100`, `x < 1400`), runs batched `ResNet18_Weights.DEFAULT` inference, and appends rows continuously to one CSV so partial results are visible before the job finishes.
+
+Example direct run:
+
+```bash
+python scripts/run_all_raw_image_embeddings.py \
+  --raw-data-dir /share/lab_crd/lab_crd/CLONEID/data/LTEEs \
+  --output-csv data/all_images/manifests/raw_image_embeddings.csv \
+  --run-manifest data/all_images/manifests/raw_image_embedding_runs.csv \
+  --embedding-batch-size 64
+```
+
+By default the output CSV also acts as the completion ledger: re-running the script appends only images whose `source_filepath` is not already present in `data/all_images/manifests/raw_image_embeddings.csv`. Pass `--overwrite-existing` to rebuild that CSV from scratch.
+
+For cluster submission, use [scripts/submit_all_raw_image_embeddings.slurm](./scripts/submit_all_raw_image_embeddings.slurm).
+
 To save a compact per-image list of object sizes from the full-run embedding CSVs:
 
 ```bash
