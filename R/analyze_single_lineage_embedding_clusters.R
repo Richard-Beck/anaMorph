@@ -8,7 +8,8 @@ parse_args <- function(args) {
     k_max = "20",
     nstart = "20",
     representative_cells = "12",
-    n_cores = "1"
+    n_cores = "1",
+    max_metric_cells = "5000"
   )
 
   i <- 1
@@ -32,6 +33,7 @@ parse_args <- function(args) {
   parsed$nstart <- as.integer(parsed$nstart)
   parsed$representative_cells <- as.integer(parsed$representative_cells)
   parsed$n_cores <- as.integer(parsed$n_cores)
+  parsed$max_metric_cells <- as.integer(parsed$max_metric_cells)
   parsed
 }
 
@@ -211,7 +213,7 @@ extract_object_crop <- function(image, mask, label, min_row, min_col, max_row, m
   crop
 }
 
-evaluate_k_grid <- function(dt, feature_cols, k_max, nstart, seed = 1L) {
+evaluate_k_grid <- function(dt, feature_cols, k_max, nstart, seed = 1L, max_metric_cells = 5000L) {
   feature_mat <- as.matrix(dt[, ..feature_cols])
   storage.mode(feature_mat) <- "double"
   keep_rows <- stats::complete.cases(feature_mat)
@@ -228,13 +230,20 @@ evaluate_k_grid <- function(dt, feature_cols, k_max, nstart, seed = 1L) {
     stop("No valid cluster counts available.", call. = FALSE)
   }
 
-  dist_mat <- stats::dist(filtered_mat)
+  metric_idx <- seq_len(n_obs)
+  if (n_obs > max_metric_cells) {
+    set.seed(seed)
+    metric_idx <- sort(sample.int(n_obs, size = max_metric_cells, replace = FALSE))
+  }
+  metric_mat <- filtered_mat[metric_idx, , drop = FALSE]
+  metric_n <- nrow(metric_mat)
+  dist_mat <- stats::dist(metric_mat)
   eval_list <- lapply(candidate_ks, function(k) {
     set.seed(seed)
-    km <- stats::kmeans(filtered_mat, centers = k, nstart = nstart)
+    km <- stats::kmeans(metric_mat, centers = k, nstart = nstart)
     sil <- cluster::silhouette(km$cluster, dist_mat)
     mean_sil <- mean(sil[, "sil_width"])
-    ch <- (km$betweenss / (k - 1)) / (km$tot.withinss / (n_obs - k))
+    ch <- (km$betweenss / (k - 1)) / (km$tot.withinss / (metric_n - k))
     list(
       k = k,
       model = km,
@@ -255,19 +264,23 @@ evaluate_k_grid <- function(dt, feature_cols, k_max, nstart, seed = 1L) {
 
   best_idx <- which.max(metrics_dt$mean_silhouette)
   best_result <- eval_list[[best_idx]]
-  centers <- best_result$model$centers[best_result$model$cluster, , drop = FALSE]
+  set.seed(seed)
+  final_model <- stats::kmeans(filtered_mat, centers = best_result$k, nstart = nstart)
+  centers <- final_model$centers[final_model$cluster, , drop = FALSE]
   cluster_distance <- sqrt(rowSums((filtered_mat - centers) ^ 2))
 
   clustered_dt <- data.table::copy(filtered_dt)
-  clustered_dt[, cluster := factor(best_result$model$cluster)]
+  clustered_dt[, cluster := factor(final_model$cluster)]
   clustered_dt[, cluster_distance := cluster_distance]
 
   list(
     metrics = metrics_dt,
     clustered_tbl = clustered_dt,
     best_k = best_result$k,
-    best_model = best_result$model,
-    feature_cols = feature_cols
+    best_model = final_model,
+    feature_cols = feature_cols,
+    metric_cells = metric_n,
+    clustered_cells = n_obs
   )
 }
 
@@ -486,9 +499,15 @@ write_cluster_panels <- function(clustered_dt, crop_meta_dt, out_dir, n_each, n_
   }
 }
 
-run_scope_clustering <- function(scope_name, score_dt, feature_cols, crop_meta_dt, out_dir, k_max, nstart, representative_cells, n_cores) {
+run_scope_clustering <- function(scope_name, score_dt, feature_cols, crop_meta_dt, out_dir, k_max, nstart, representative_cells, n_cores, max_metric_cells) {
   ensure_dir(out_dir)
-  result <- evaluate_k_grid(score_dt, feature_cols, k_max = k_max, nstart = nstart)
+  result <- evaluate_k_grid(
+    score_dt,
+    feature_cols,
+    k_max = k_max,
+    nstart = nstart,
+    max_metric_cells = max_metric_cells
+  )
 
   data.table::fwrite(result$metrics, file.path(out_dir, "clustering_metrics.csv"))
   metric_plot <- plot_metric_grid(result$metrics, sprintf("%s clustering metrics", scope_name))
@@ -516,7 +535,8 @@ run_scope_clustering <- function(scope_name, score_dt, feature_cols, crop_meta_d
   list(
     best_k = result$best_k,
     n_cells = nrow(clustered_dt),
-    metrics = result$metrics
+    metrics = result$metrics,
+    metric_cells = result$metric_cells
   )
 }
 
@@ -533,6 +553,7 @@ main <- function() {
   args <- parse_args(commandArgs(trailingOnly = TRUE))
   project_root <- resolve_project_root()
   if (!is.finite(args$n_cores) || args$n_cores < 1L) args$n_cores <- 1L
+  if (!is.finite(args$max_metric_cells) || args$max_metric_cells < 100L) args$max_metric_cells <- 5000L
 
   lineage_rds <- project_path(project_root, args$lineage_rds)
   lineage_scores_dir <- file.path(project_path(project_root, args$lineage_scores_dir), paste0("lineage_", args$lineage_id))
@@ -603,7 +624,8 @@ main <- function() {
     k_max = args$k_max,
     nstart = args$nstart,
     representative_cells = args$representative_cells,
-    n_cores = args$n_cores
+    n_cores = args$n_cores,
+    max_metric_cells = args$max_metric_cells
   )
 
   for (quantile_name in sort(unique(stats::na.omit(score_dt$quantile)))) {
@@ -621,7 +643,8 @@ main <- function() {
       k_max = args$k_max,
       nstart = args$nstart,
       representative_cells = args$representative_cells,
-      n_cores = args$n_cores
+      n_cores = args$n_cores,
+      max_metric_cells = args$max_metric_cells
     )
   }
 
@@ -630,7 +653,8 @@ main <- function() {
     data.table::data.table(
       scope = scope_name,
       best_k = x$best_k,
-      n_cells = x$n_cells
+      n_cells = x$n_cells,
+      metric_cells = x$metric_cells
     )
   }), use.names = TRUE, fill = TRUE)
   data.table::fwrite(summary_dt, file.path(out_dir, "clustering_summary.csv"))
@@ -638,6 +662,7 @@ main <- function() {
   cat(sprintf("Lineage: %s\n", args$lineage_id))
   cat(sprintf("Cells available for clustering: %d\n", nrow(score_dt)))
   cat(sprintf("PC features used: %d\n", length(feature_cols)))
+  cat(sprintf("Metric evaluation cells (max): %d\n", args$max_metric_cells))
   cat(sprintf("Crop export cores: %d\n", args$n_cores))
   cat(sprintf("Warnings emitted: %d\n", length(warning_state$messages)))
   if (length(warning_state$messages)) {
