@@ -1074,6 +1074,16 @@ curve_path_tbl <- tibble(
   PC2 = numeric(),
   lambda = numeric()
 )
+curve_projection_tbl <- tibble(
+  filename = character(),
+  lineage_id = factor(),
+  PC1 = numeric(),
+  PC2 = numeric(),
+  curve_PC1 = numeric(),
+  curve_PC2 = numeric(),
+  lambda = numeric(),
+  distance_to_curve = numeric()
+)
 
 if (has_princurve) {
   curve_input <- as.matrix(score_tbl[, curve_feature_cols])
@@ -1124,6 +1134,18 @@ if (has_princurve) {
   ) %>%
     arrange(lambda)
 
+  curve_projection_tbl <- latent_tbl %>%
+    transmute(
+      filename,
+      lineage_id,
+      PC1,
+      PC2,
+      curve_PC1 = principal_curve_fit$s[, 1],
+      curve_PC2 = principal_curve_fit$s[, 2],
+      lambda = curve_lambda,
+      distance_to_curve = curve_distance
+    )
+
   curve_diag_tbl <- curve_diag_tbl %>%
     mutate(
       path_length_ratio = path_length_ratio,
@@ -1150,6 +1172,21 @@ if (!exists("curve_path_tbl") ||
   )
 }
 
+if (!exists("curve_projection_tbl") ||
+    !is.data.frame(curve_projection_tbl) ||
+    !all(c("PC1", "PC2", "curve_PC1", "curve_PC2", "lambda", "distance_to_curve") %in% names(curve_projection_tbl))) {
+  curve_projection_tbl <- tibble(
+    filename = character(),
+    lineage_id = factor(),
+    PC1 = numeric(),
+    PC2 = numeric(),
+    curve_PC1 = numeric(),
+    curve_PC2 = numeric(),
+    lambda = numeric(),
+    distance_to_curve = numeric()
+  )
+}
+
 latent_method_tbl <- tibble(
   chosen_method = unique(latent_tbl$latent_score_method),
   curve_basis = unique(latent_tbl$curve_basis),
@@ -1168,6 +1205,12 @@ Interpretation:
 - the main staging variable used below is `latent_tbl$latent_score`
 - if the chosen method is `shared_principal_curve_arc_length`, then every downstream alignment and stage plot is based on distance along one shared curved path in `PC1-PC2`
 - the main diagnostics to watch are the path-length ratio, the nonlinear gain in `PC2`, and the distance-to-curve distribution
+
+Mapping rule used here:
+
+- each image is projected to the nearest point on the fitted shared curve in `PC1/PC2`
+- `distance_to_curve` is the Euclidean distance from the observed point to that projection
+- `latent_score` is rescaled arc length (`lambda`) of that projected point along the curve
 
 ```{r shared-curve-in-pca}
 shared_curve_plot <- ggplot(latent_tbl, aes(x = PC1, y = PC2, color = latent_score)) +
@@ -1196,6 +1239,42 @@ if (exists("curve_path_tbl") &&
 }
 
 shared_curve_plot
+```
+
+```{r curve-projection-diagnostic}
+projection_plot_tbl <- curve_projection_tbl %>%
+  filter(is.finite(distance_to_curve))
+
+if (nrow(projection_plot_tbl) > 80) {
+  projection_plot_tbl <- bind_rows(
+    projection_plot_tbl %>% slice_min(order_by = distance_to_curve, n = 40, with_ties = FALSE),
+    projection_plot_tbl %>% slice_max(order_by = distance_to_curve, n = 40, with_ties = FALSE)
+  ) %>%
+    distinct(filename, .keep_all = TRUE)
+}
+
+if (nrow(curve_path_tbl) >= 2 && nrow(projection_plot_tbl) >= 1) {
+  ggplot() +
+    geom_path(data = curve_path_tbl, aes(x = PC1, y = PC2), linewidth = 1.2, color = "black") +
+    geom_segment(
+      data = projection_plot_tbl,
+      aes(x = PC1, y = PC2, xend = curve_PC1, yend = curve_PC2, color = lineage_id),
+      alpha = 0.25,
+      linewidth = 0.4
+    ) +
+    geom_point(data = projection_plot_tbl, aes(x = PC1, y = PC2, color = lineage_id), alpha = 0.75, size = 1.8) +
+    geom_point(data = projection_plot_tbl, aes(x = curve_PC1, y = curve_PC2), color = "black", alpha = 0.5, size = 1) +
+    scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+    labs(
+      title = "Projection of images onto the shared curve",
+      subtitle = "Segments show Euclidean projection in PC1/PC2; black points are the assigned closest points on the curve",
+      x = "PC1",
+      y = "PC2",
+      color = "Lineage"
+    )
+} else {
+  cat("Projection diagnostic skipped because the shared curve was not fit.\n")
+}
 ```
 
 ## Straight-Axis Versus Curved Progression
