@@ -8,8 +8,10 @@ params:
   lineage_rds: "core_data/lineages.Rds"
   embedding_csv: "data/all_images/manifests/raw_image_embeddings.csv"
   exemplar_lineages: null
+  control_lineage: null
   n_top_pcs: 8
   n_stage_bins: 5
+  candidate_top_n: 20
 ---
 
 ```{r setup, include=FALSE}
@@ -391,6 +393,125 @@ predict_time_to_stage <- function(df, lineage_levels, stage_grid) {
     })
   })
 }
+
+fit_lineage_trajectory_grid <- function(df, lineage_levels, pc_x = "PC1", pc_y = "PC2", n_points = 100) {
+  purrr::map_dfr(lineage_levels, function(lineage_id) {
+    dat <- df %>%
+      filter(lineage_id == .env$lineage_id) %>%
+      filter(is.finite(time_since_seeding_days))
+
+    if (nrow(dat) < 8 || dplyr::n_distinct(dat$time_since_seeding_days) < 4) {
+      return(tibble())
+    }
+
+    time_grid <- seq(
+      min(dat$time_since_seeding_days, na.rm = TRUE),
+      max(dat$time_since_seeding_days, na.rm = TRUE),
+      length.out = n_points
+    )
+
+    fit_x <- mgcv::gam(
+      reformulate(sprintf("s(time_since_seeding_days, k = %d)", min(8, dplyr::n_distinct(dat$time_since_seeding_days) - 1)), response = pc_x),
+      data = dat,
+      method = "REML"
+    )
+    fit_y <- mgcv::gam(
+      reformulate(sprintf("s(time_since_seeding_days, k = %d)", min(8, dplyr::n_distinct(dat$time_since_seeding_days) - 1)), response = pc_y),
+      data = dat,
+      method = "REML"
+    )
+
+    tibble(
+      lineage_id = lineage_id,
+      time_since_seeding_days = time_grid,
+      x = as.numeric(predict(fit_x, newdata = tibble(time_since_seeding_days = time_grid))),
+      y = as.numeric(predict(fit_y, newdata = tibble(time_since_seeding_days = time_grid))),
+      view = paste(pc_x, pc_y, sep = "_")
+    )
+  })
+}
+
+infer_control_lineage <- function(df, requested_control = NULL) {
+  lineage_levels <- levels(df$lineage_id) %||% unique(as.character(df$lineage_id))
+  if (!is.null(requested_control) && nzchar(requested_control)) {
+    return(as.character(requested_control))
+  }
+
+  if ("condition_label" %in% names(df)) {
+    cond_tbl <- df %>%
+      mutate(condition_label = ifelse(is.na(condition_label), "", as.character(condition_label))) %>%
+      group_by(lineage_id) %>%
+      summarise(
+        control_label_score = mean(grepl("untreated|control|normox|normoxia", tolower(condition_label)), na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(control_label_score), lineage_id)
+    if (nrow(cond_tbl) && is.finite(cond_tbl$control_label_score[[1]]) && cond_tbl$control_label_score[[1]] > 0) {
+      return(as.character(cond_tbl$lineage_id[[1]]))
+    }
+  }
+
+  sampling_tbl <- df %>%
+    filter(is.finite(time_since_seeding_days)) %>%
+    mutate(time_bin = round(time_since_seeding_days, 2)) %>%
+    dplyr::count(lineage_id, passage_id, time_bin, name = "n_images") %>%
+    dplyr::count(lineage_id, passage_id, name = "n_timepoints") %>%
+    group_by(lineage_id) %>%
+    summarise(
+      median_timepoints_per_passage = median(n_timepoints, na.rm = TRUE),
+      n_images = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(median_timepoints_per_passage, n_images, lineage_id)
+
+  as.character(sampling_tbl$lineage_id[[1]])
+}
+
+nn_match_between_groups <- function(query_tbl, target_tbl, feature_cols) {
+  if (!nrow(query_tbl) || !nrow(target_tbl)) {
+    return(tibble())
+  }
+
+  query_mat <- as.matrix(query_tbl[, feature_cols])
+  target_mat <- as.matrix(target_tbl[, feature_cols])
+
+  out <- vector("list", nrow(query_tbl))
+  for (i in seq_len(nrow(query_tbl))) {
+    d <- sqrt(rowSums((t(t(target_mat) - query_mat[i, ]))^2))
+    j <- which.min(d)
+    out[[i]] <- tibble(
+      query_row = i,
+      nn_index = j,
+      nn_distance = d[[j]]
+    )
+  }
+
+  bind_rows(out)
+}
+
+curvature_diagnostic_tbl <- function(df) {
+  linear_pc2 <- lm(PC2 ~ PC1, data = df)
+  smooth_pc2 <- mgcv::gam(PC2 ~ s(PC1, k = min(8, max(4, dplyr::n_distinct(round(df$PC1, 3)) - 1))), data = df, method = "REML")
+
+  out <- tibble(
+    linear_r2_pc2_on_pc1 = summary(linear_pc2)$adj.r.squared,
+    smooth_r2_pc2_on_pc1 = summary(smooth_pc2)$r.sq,
+    nonlinear_gain_pc2_on_pc1 = summary(smooth_pc2)$r.sq - summary(linear_pc2)$adj.r.squared
+  )
+
+  if ("PC3" %in% names(df)) {
+    linear_pc3 <- lm(PC3 ~ PC1, data = df)
+    smooth_pc3 <- mgcv::gam(PC3 ~ s(PC1, k = min(8, max(4, dplyr::n_distinct(round(df$PC1, 3)) - 1))), data = df, method = "REML")
+    out <- out %>%
+      mutate(
+        linear_r2_pc3_on_pc1 = summary(linear_pc3)$adj.r.squared,
+        smooth_r2_pc3_on_pc1 = summary(smooth_pc3)$r.sq,
+        nonlinear_gain_pc3_on_pc1 = summary(smooth_pc3)$r.sq - summary(linear_pc3)$adj.r.squared
+      )
+  }
+
+  out
+}
 ```
 
 ## Load the Exemplar Panel
@@ -477,7 +598,7 @@ Coverage plots are the first place to see whether irregular sampling or passage 
 
 ```{r coverage-plots}
 coverage_tbl <- analysis_tbl %>%
-  count(lineage_id, passage_position, time_since_seeding_days, name = "n_images")
+  dplyr::count(lineage_id, passage_position, time_since_seeding_days, name = "n_images")
 
 ggplot(coverage_tbl, aes(x = time_since_seeding_days, y = factor(passage_position), size = n_images, color = lineage_id)) +
   geom_point(alpha = 0.8) +
@@ -702,7 +823,7 @@ Interpretation:
 
 ## PC Scores Versus Time and Density Covariates
 
-The next plots examine the leading PCs directly. They help decide whether a single PC is interpretable enough to serve as a provisional progression axis.
+The next plots examine the leading PCs directly. These are now used as explicit diagnostics for whether a straight-axis progression is adequate or whether the trajectory is genuinely curved in low-dimensional space.
 
 ```{r pc-trends}
 pc_long <- score_tbl %>%
@@ -724,8 +845,8 @@ ggplot(pc_long, aes(x = time_since_seeding_days, y = score, color = lineage_id))
 
 ```{r pc-vs-covariates}
 pc_cov_long <- score_tbl %>%
-  select(lineage_id, PC1, PC2, confluence, cell_count) %>%
-  pivot_longer(cols = c(PC1, PC2), names_to = "pc", values_to = "score") %>%
+  select(lineage_id, any_of(c("PC1", "PC2", "PC3")), confluence, cell_count) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "pc", values_to = "score") %>%
   pivot_longer(cols = c(confluence, cell_count), names_to = "covariate", values_to = "value")
 
 ggplot(pc_cov_long, aes(x = value, y = score, color = lineage_id)) +
@@ -743,8 +864,95 @@ ggplot(pc_cov_long, aes(x = value, y = score, color = lineage_id)) +
 
 Interpretation:
 
-- a usable simple progression axis should change smoothly with time in more than one lineage
-- if PC1 mostly reproduces confluence or cell count and little else, it is still informative, but it should be interpreted as a density-linked state axis rather than a generic morphology axis
+- if time is expressed mainly along one straight PC axis, then `PC1` can remain a reasonable baseline summary
+- if multiple PCs change smoothly and jointly, especially with turning structure in `PC1-PC2` or `PC1-PC2-PC3`, then a curved trajectory is more appropriate than `PC1` alone
+
+## Curvature Diagnostics in PCA Space
+
+These views are the main visual test of whether a curved latent trajectory is warranted.
+
+```{r pca-curvature-views}
+pc_view_tbl <- bind_rows(
+  score_tbl %>%
+    transmute(lineage_id, passage_position, time_since_seeding_days, confluence, cell_count, view = "PC1 vs PC2", x = PC1, y = PC2),
+  score_tbl %>%
+    mutate(PC3 = if ("PC3" %in% names(score_tbl)) PC3 else NA_real_) %>%
+    transmute(lineage_id, passage_position, time_since_seeding_days, confluence, cell_count, view = "PC1 vs PC3", x = PC1, y = PC3)
+)
+
+plot_pc_view <- function(color_var, title_text, scale_fn = scale_color_viridis_c(option = "C", na.value = "grey80")) {
+  ggplot(pc_view_tbl, aes(x = x, y = y, color = .data[[color_var]])) +
+    geom_point(size = 2, alpha = 0.85) +
+    facet_wrap(~ view, scales = "free") +
+    scale_fn +
+    labs(
+      title = title_text,
+      x = NULL,
+      y = NULL,
+      color = color_var
+    )
+}
+
+plot_pc_view("time_since_seeding_days", "PC-space views colored by time since seeding")
+plot_pc_view("confluence", "PC-space views colored by confluence")
+plot_pc_view("cell_count", "PC-space views colored by cell count")
+
+ggplot(pc_view_tbl, aes(x = x, y = y, color = lineage_id)) +
+  geom_point(size = 2, alpha = 0.85) +
+  facet_wrap(~ view, scales = "free") +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "PC-space views colored by lineage",
+    x = NULL,
+    y = NULL,
+    color = "Lineage"
+  )
+
+ggplot(pc_view_tbl, aes(x = x, y = y, color = passage_position)) +
+  geom_point(size = 2, alpha = 0.85) +
+  facet_wrap(~ view, scales = "free") +
+  scale_color_viridis_c(option = "D", na.value = "grey80") +
+  labs(
+    title = "PC-space views colored by passage position",
+    x = NULL,
+    y = NULL,
+    color = "Passage"
+  )
+```
+
+```{r smooth-trajectories}
+trajectory_grid_12 <- fit_lineage_trajectory_grid(score_tbl, lineage_levels, pc_x = "PC1", pc_y = "PC2")
+trajectory_grid_13 <- if ("PC3" %in% names(score_tbl)) {
+  fit_lineage_trajectory_grid(score_tbl, lineage_levels, pc_x = "PC1", pc_y = "PC3")
+} else {
+  tibble()
+}
+
+trajectory_grid <- bind_rows(trajectory_grid_12, trajectory_grid_13)
+
+ggplot(pc_view_tbl, aes(x = x, y = y, color = lineage_id)) +
+  geom_point(alpha = 0.3, size = 1.8) +
+  geom_path(data = trajectory_grid, linewidth = 1.15, lineend = "round") +
+  facet_wrap(~ view, scales = "free") +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Lineage-specific smooth trajectories in PCA space",
+    subtitle = "These curves summarize how each lineage moves through the leading PCs over time",
+    x = NULL,
+    y = NULL,
+    color = "Lineage"
+  )
+```
+
+```{r curvature-summary}
+curve_diag_tbl <- curvature_diagnostic_tbl(score_tbl)
+knitr::kable(curve_diag_tbl, digits = 3)
+```
+
+Interpretation:
+
+- a curved trajectory is justified when the time gradient bends visibly through `PC1-PC2` or `PC1-PC2-PC3`, and when smooth fits of `PC2` or `PC3` as functions of `PC1` outperform a straight-line description
+- if those gains are trivial and the point cloud is effectively collinear, `PC1` remains a fair summary baseline
 
 ## Secondary Nonlinear View
 
@@ -827,127 +1035,151 @@ Interpretation:
 - low cross-lineage nearest-neighbor distances support the idea that different lineages revisit similar image states
 - very large distances would argue for lineage-specific trajectories even if each lineage changes smoothly on its own
 
-## Smooth Trajectories in Low-Dimensional Space
+## Derive a Refined Latent Progression Score
 
-Now model each lineage as a smooth path through the first two PCs as a function of `time_since_seeding`.
+The straight-axis baseline is still useful, but the refined trajectory analysis now treats `PC1` as a comparator rather than the default.
 
-This is still descriptive. The purpose is to see whether the lineages move through similar regions but at different rates, not to force them onto one common curve.
-
-```{r smooth-trajectories}
-trajectory_grid <- purrr::map_dfr(lineage_levels, function(lineage_id) {
-  dat <- score_tbl %>%
-    filter(lineage_id == .env$lineage_id) %>%
-    filter(is.finite(time_since_seeding_days))
-
-  if (nrow(dat) < 8 || dplyr::n_distinct(dat$time_since_seeding_days) < 4) {
-    return(tibble())
-  }
-
-  time_grid <- seq(
-    min(dat$time_since_seeding_days, na.rm = TRUE),
-    max(dat$time_since_seeding_days, na.rm = TRUE),
-    length.out = 100
-  )
-
-  fit_pc1 <- mgcv::gam(
-    PC1 ~ s(time_since_seeding_days, k = min(8, dplyr::n_distinct(dat$time_since_seeding_days) - 1)),
-    data = dat,
-    method = "REML"
-  )
-  fit_pc2 <- mgcv::gam(
-    PC2 ~ s(time_since_seeding_days, k = min(8, dplyr::n_distinct(dat$time_since_seeding_days) - 1)),
-    data = dat,
-    method = "REML"
-  )
-
-  tibble(
-    lineage_id = lineage_id,
-    time_since_seeding_days = time_grid,
-    PC1 = as.numeric(predict(fit_pc1, newdata = tibble(time_since_seeding_days = time_grid))),
-    PC2 = as.numeric(predict(fit_pc2, newdata = tibble(time_since_seeding_days = time_grid)))
-  )
-})
-
-ggplot(score_tbl, aes(x = PC1, y = PC2, color = lineage_id)) +
-  geom_point(alpha = 0.35, size = 1.8) +
-  geom_path(data = trajectory_grid, linewidth = 1.2, lineend = "round") +
-  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
-  labs(
-    title = "Lineage-specific smooth trajectories in PCA space",
-    subtitle = "Curves are smooths of PC1 and PC2 versus time since seeding",
-    x = "PC1",
-    y = "PC2",
-    color = "Lineage"
-  )
-```
-
-Interpretation:
-
-- a shared trajectory is most plausible when these smooths trace broadly similar routes through the same region
-- if the curves point in different directions or occupy different lobes, that is evidence for genuinely different lineage paths rather than rate differences along a common path
-
-## Derive a Provisional Latent Progression Score
-
-The simplest useful latent score is often just PC1. A principal curve is only worth using if it adds meaningful curvature beyond what PC1 already captures.
-
-The notebook therefore tries both when possible and chooses the simpler score if the principal-curve ordering is nearly the same as PC1.
+The main candidate latent variable is arc length along a principal curve fit in `PC1-PC2-PC3` space when available, or `PC1-PC2` if only two PCs are informative. The fitted curve also provides a distance-to-curve diagnostic, which helps distinguish on-trajectory progression from outlying images.
 
 ```{r latent-score}
 pc1_oriented <- score_tbl$PC1
-
-# Orient the simple PC1 score so larger values correspond to later average times.
 if (stats::cor(pc1_oriented, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman") < 0) {
   pc1_oriented <- -pc1_oriented
 }
+
+curve_feature_cols <- c("PC1", "PC2", "PC3")
+curve_feature_cols <- curve_feature_cols[curve_feature_cols %in% names(score_tbl)]
 
 latent_tbl <- score_tbl %>%
   mutate(
     latent_score_pc1 = rescale01(pc1_oriented),
     latent_score = latent_score_pc1,
-    latent_score_method = "PC1"
+    latent_arc_length = latent_score_pc1,
+    distance_to_curve = NA_real_,
+    latent_score_method = "PC1_baseline",
+    curve_basis = "PC1"
   )
 
-if (has_princurve && length(score_cols) >= 3) {
-  curve_input <- as.matrix(score_tbl[, c("PC1", "PC2", "PC3")])
+curve_diag_tbl <- curve_diag_tbl %>%
+  mutate(curved_trajectory_warranted = FALSE)
+
+if (has_princurve && length(curve_feature_cols) >= 2) {
+  curve_input <- as.matrix(score_tbl[, curve_feature_cols])
   principal_curve_fit <- princurve::principal_curve(curve_input)
 
-  lambda <- principal_curve_fit$lambda
-  if (stats::cor(lambda, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman") < 0) {
-    lambda <- -lambda
+  curve_lambda <- principal_curve_fit$lambda
+  if (stats::cor(curve_lambda, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman") < 0) {
+    curve_lambda <- -curve_lambda
   }
 
-  lambda01 <- rescale01(lambda)
-  pc1_vs_curve <- stats::cor(latent_tbl$latent_score_pc1, lambda01, use = "pairwise.complete.obs", method = "spearman")
+  curve_lambda <- curve_lambda - min(curve_lambda, na.rm = TRUE)
+  curve_lambda01 <- rescale01(curve_lambda)
+  curve_distance <- principal_curve_fit$dist
 
-  if (is.finite(pc1_vs_curve) && abs(pc1_vs_curve) < 0.95) {
+  path_length_ratio <- sum(sqrt(rowSums(diff(principal_curve_fit$s[order(curve_lambda), , drop = FALSE])^2)), na.rm = TRUE) /
+    sqrt(sum((principal_curve_fit$s[which.max(curve_lambda), ] - principal_curve_fit$s[which.min(curve_lambda), ])^2))
+
+  curve_vs_pc1 <- stats::cor(curve_lambda01, latent_tbl$latent_score_pc1, use = "pairwise.complete.obs", method = "spearman")
+  curve_vs_time <- stats::cor(curve_lambda01, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman")
+
+  curved_trajectory_warranted <- is.finite(path_length_ratio) &&
+    (
+      path_length_ratio > 1.08 ||
+      (("nonlinear_gain_pc2_on_pc1" %in% names(curve_diag_tbl)) && curve_diag_tbl$nonlinear_gain_pc2_on_pc1[[1]] > 0.05) ||
+      (("nonlinear_gain_pc3_on_pc1" %in% names(curve_diag_tbl)) && curve_diag_tbl$nonlinear_gain_pc3_on_pc1[[1]] > 0.03)
+    )
+
+  latent_tbl <- latent_tbl %>%
+    mutate(
+      latent_score_curve = curve_lambda01,
+      latent_arc_length_curve = curve_lambda,
+      distance_to_curve = curve_distance
+    )
+
+  if (curved_trajectory_warranted) {
     latent_tbl <- latent_tbl %>%
       mutate(
-        latent_score_curve = lambda01,
-        latent_score = lambda01,
-        latent_score_method = "principal_curve"
+        latent_score = latent_score_curve,
+        latent_arc_length = latent_arc_length_curve,
+        latent_score_method = "principal_curve_arc_length",
+        curve_basis = paste(curve_feature_cols, collapse = " + ")
       )
-  } else {
-    latent_tbl <- latent_tbl %>%
-      mutate(latent_score_curve = lambda01)
   }
+
+  curve_diag_tbl <- curve_diag_tbl %>%
+    mutate(
+      path_length_ratio = path_length_ratio,
+      spearman_curve_vs_pc1 = curve_vs_pc1,
+      spearman_curve_vs_time = curve_vs_time,
+      curved_trajectory_warranted = curved_trajectory_warranted
+    )
 } else {
   latent_tbl <- latent_tbl %>%
-    mutate(latent_score_curve = NA_real_)
+    mutate(
+      latent_score_curve = NA_real_,
+      latent_arc_length_curve = NA_real_
+    )
 }
 
 latent_method_tbl <- tibble(
   chosen_method = unique(latent_tbl$latent_score_method),
+  curve_basis = unique(latent_tbl$curve_basis),
   spearman_pc1_vs_time = cor(latent_tbl$latent_score_pc1, latent_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman"),
-  spearman_latent_vs_time = cor(latent_tbl$latent_score, latent_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman")
+  spearman_curve_vs_time = if ("latent_score_curve" %in% names(latent_tbl)) cor(latent_tbl$latent_score_curve, latent_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman") else NA_real_,
+  spearman_main_latent_vs_time = cor(latent_tbl$latent_score, latent_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman"),
+  median_distance_to_curve = median(latent_tbl$distance_to_curve, na.rm = TRUE)
 )
 
 knitr::kable(latent_method_tbl, digits = 3)
+knitr::kable(curve_diag_tbl, digits = 3)
 ```
 
 Interpretation:
 
-- if the chosen method is `PC1`, that means the notebook judged the simple linear axis to be adequate
-- if the chosen method is `principal_curve`, interpret that as mild evidence that the common progression bends in low-dimensional space
+- if the principal-curve score is chosen, that means the notebook found enough geometric curvature to justify moving beyond `PC1`
+- the main diagnostics to watch are the path-length ratio, the nonlinear gains from `PC2` and `PC3`, and the distance-to-curve distribution
+
+## Straight-Axis Versus Curved Progression
+
+This section makes the comparison explicit rather than assuming the curve is automatically better.
+
+```{r straight-vs-curved}
+latent_compare_long <- latent_tbl %>%
+  select(lineage_id, time_since_seeding_days, latent_score_pc1, latent_score_curve, distance_to_curve) %>%
+  pivot_longer(cols = c(latent_score_pc1, latent_score_curve), names_to = "score_type", values_to = "score") %>%
+  filter(is.finite(score))
+
+ggplot(latent_compare_long, aes(x = time_since_seeding_days, y = score, color = lineage_id)) +
+  geom_point(alpha = 0.65, size = 1.8) +
+  geom_smooth(se = FALSE, method = "gam", formula = y ~ s(x, k = 6), linewidth = 0.85) +
+  facet_wrap(~ score_type, scales = "free_y") +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Straight-axis versus curved latent progression",
+    subtitle = "Use this to judge whether the curved score resolves structure that PC1 compresses",
+    x = "Time since seeding (days)",
+    y = "Latent score",
+    color = "Lineage"
+  )
+```
+
+```{r distance-to-curve}
+ggplot(latent_tbl, aes(x = distance_to_curve, fill = lineage_id)) +
+  geom_histogram(alpha = 0.45, position = "identity", bins = 30) +
+  facet_wrap(~ lineage_id, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)], guide = "none") +
+  labs(
+    title = "Distance to the fitted curved trajectory",
+    subtitle = "Images far from the curve may represent noise, off-trajectory states, or geometry not captured by one path",
+    x = "Distance to principal curve",
+    y = "Image count"
+  )
+```
+
+Interpretation:
+
+- the curved score is worthwhile when it separates images that `PC1` compresses, especially in the central part of the trajectory
+- a useful principal curve should produce moderate distances for most images rather than fitting only a thin subset of the cloud
 
 ## Latent Progression Score Versus Time Since Seeding
 
@@ -999,6 +1231,23 @@ Interpretation:
 - a strong relationship here is not a problem by itself; it becomes a problem only if latent progression is nothing more than a density proxy
 - if the same latent score occurs across a range of confluence or cell-count values, that supports a richer notion of morphological state
 
+## Lineage Occupancy Along the Latent Trajectory
+
+This view makes the sparse-versus-dense sampling problem explicit. It is especially useful for asking whether the control lineage contributes images to the middle of the shared trajectory rather than only the endpoints.
+
+```{r latent-density-by-lineage}
+ggplot(latent_tbl, aes(x = latent_score, fill = lineage_id)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ lineage_id, ncol = 1) +
+  scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)], guide = "none") +
+  labs(
+    title = "Lineage occupancy along the latent trajectory",
+    subtitle = "A useful curved trajectory should make the intermediate region visible rather than collapsing it into endpoint bins",
+    x = "Latent progression score",
+    y = "Density"
+  )
+```
+
 ## Does Temporal Structure Remain After Density Adjustment?
 
 To check whether the latent score reflects more than trivial density effects, fit a simple additive model and inspect the residual temporal structure.
@@ -1031,6 +1280,50 @@ Interpretation:
 - if temporal structure largely disappears here, the progression score is mostly a density axis
 - if clear lineage-specific time structure remains, the embeddings are likely capturing morphology beyond simple occupancy proxies
 
+```{r latent-partial-density}
+partial_density_fit <- mgcv::gam(
+  latent_score ~ s(time_since_seeding_days, k = 6) + s(log_confluence, k = 6) + s(log_cell_count, k = 6) + lineage_id,
+  data = latent_tbl,
+  method = "REML"
+)
+
+partial_terms <- predict(partial_density_fit, type = "terms")
+confluence_term_idx <- grep("log_confluence", colnames(partial_terms))
+cell_count_term_idx <- grep("log_cell_count", colnames(partial_terms))
+
+confluence_term <- if (length(confluence_term_idx)) partial_terms[, confluence_term_idx[[1]]] else 0
+cell_count_term <- if (length(cell_count_term_idx)) partial_terms[, cell_count_term_idx[[1]]] else 0
+
+latent_tbl <- latent_tbl %>%
+  mutate(
+    latent_without_confluence = latent_score - confluence_term,
+    latent_without_cell_count = latent_score - cell_count_term
+  )
+
+partial_long <- latent_tbl %>%
+  select(lineage_id, confluence, cell_count, latent_without_confluence, latent_without_cell_count) %>%
+  pivot_longer(cols = c(latent_without_confluence, latent_without_cell_count), names_to = "partial_type", values_to = "partial_score") %>%
+  mutate(x_value = ifelse(partial_type == "latent_without_confluence", confluence, cell_count))
+
+ggplot(partial_long, aes(x = x_value, y = partial_score, color = lineage_id)) +
+  geom_point(alpha = 0.6, size = 1.7) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8, linewidth = 0.8) +
+  facet_wrap(~ partial_type, scales = "free_x") +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Partial checks against simple density re-encoding",
+    subtitle = "These plots help assess whether the curved latent score carries structure beyond confluence and cell count",
+    x = NULL,
+    y = "Partial latent score",
+    color = "Lineage"
+  )
+```
+
+Interpretation:
+
+- if the latent score still varies in a structured way after subtracting a confluence or cell-count contribution, it is doing more than merely re-encoding density
+- if these partial views are nearly flat, then the curved trajectory may still mostly represent density-linked growth state
+
 ## A Simple Alignment View Based on the Latent Score
 
 Instead of forcing a formal time-warping model, use the latent score itself as the shared progression axis and estimate when each lineage reaches the same score levels.
@@ -1058,17 +1351,26 @@ Interpretation:
 - if lineages have similar stage ordering but systematically different times-to-stage, that supports the idea of shared morphology traversed at different rates
 - if the curves cross erratically or cannot be estimated for large parts of the score range, the notion of one shared progression is weaker
 
-## Provisional Morphological Stage Bins
+## Refined Morphological Stage Bins
 
-For a first-pass stratification, divide the latent score into broad bins. Quantile-based bins keep the stage definition robust to unequal lineage sizes and irregular sampling.
+The stage bins are now chosen to give extra resolution in the middle of the trajectory instead of defaulting to a crude endpoint split.
 
 ```{r stage-bins}
-stage_breaks <- unique(quantile(latent_tbl$latent_score, probs = seq(0, 1, length.out = params$n_stage_bins + 1), na.rm = TRUE))
-if (length(stage_breaks) < 3) {
-  stop("Latent score does not have enough spread to define stage bins.", call. = FALSE)
+stage_probs <- c(0, 0.12, 0.30, 0.42, 0.58, 0.70, 0.88, 1)
+stage_breaks <- unique(quantile(latent_tbl$latent_score, probs = stage_probs, na.rm = TRUE))
+if (length(stage_breaks) < 4) {
+  stop("Latent score does not have enough spread to define refined stage bins.", call. = FALSE)
 }
 
-stage_labels <- paste0("Stage ", seq_len(length(stage_breaks) - 1))
+stage_labels <- c(
+  "Early / Seeded",
+  "Early Growth",
+  "Intermediate A",
+  "Intermediate Core",
+  "Intermediate B",
+  "Late Growth",
+  "Late / Near-Confluent"
+)[seq_len(length(stage_breaks) - 1)]
 
 latent_tbl <- latent_tbl %>%
   mutate(
@@ -1077,34 +1379,28 @@ latent_tbl <- latent_tbl %>%
       breaks = stage_breaks,
       include.lowest = TRUE,
       labels = stage_labels
-    )
+    ),
+    intermediate_region = latent_score >= quantile(latent_score, probs = 0.30, na.rm = TRUE) &
+      latent_score <= quantile(latent_score, probs = 0.70, na.rm = TRUE)
   )
 ```
-
-Plot the stage bins back onto PCA space first, so the discretization can be checked against the continuous geometry.
 
 ```{r stage-in-pca}
 ggplot(latent_tbl, aes(x = PC1, y = PC2, color = stage_bin)) +
   geom_point(alpha = 0.85, size = 2.1) +
   scale_color_brewer(palette = "Spectral", direction = -1, na.value = "grey80") +
   labs(
-    title = "Provisional stage bins mapped onto PCA state space",
+    title = "Refined stage bins mapped onto PCA state space",
+    subtitle = "The middle of the trajectory is intentionally given more resolution",
     x = "PC1",
     y = "PC2",
     color = "Stage bin"
   )
 ```
 
-Interpretation:
-
-- good stage bins should tile a coherent progression through PCA space rather than forming noisy checkerboards
-- if the bins jump around spatially, the latent score is not stable enough for stage-based comparison
-
-Now check how the lineages populate those stage bins.
-
 ```{r stage-composition}
 stage_comp_tbl <- latent_tbl %>%
-  count(stage_bin, lineage_id, name = "n_images") %>%
+  dplyr::count(stage_bin, lineage_id, name = "n_images") %>%
   group_by(stage_bin) %>%
   mutate(stage_fraction = n_images / sum(n_images)) %>%
   ungroup()
@@ -1114,11 +1410,12 @@ ggplot(stage_comp_tbl, aes(x = stage_bin, y = stage_fraction, fill = lineage_id)
   scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)]) +
   scale_y_continuous(labels = percent_format(accuracy = 1)) +
   labs(
-    title = "Lineage composition within provisional morphological stage bins",
+    title = "Lineage composition within refined morphological stage bins",
     x = "Stage bin",
     y = "Fraction of images in bin",
     fill = "Lineage"
-  )
+  ) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
 ```
 
 ```{r stage-time-boxplots}
@@ -1126,12 +1423,13 @@ ggplot(latent_tbl, aes(x = stage_bin, y = time_since_seeding_days, fill = lineag
   geom_boxplot(alpha = 0.8, outlier.alpha = 0.35, position = position_dodge(width = 0.8)) +
   scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)]) +
   labs(
-    title = "Time since seeding within each provisional stage bin",
-    subtitle = "Comparable stages occurring at different times support the alignment idea",
+    title = "Time since seeding within refined stage bins",
+    subtitle = "Comparable intermediate stages should be populated at different times across lineages",
     x = "Stage bin",
     y = "Time since seeding (days)",
     fill = "Lineage"
-  )
+  ) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
 ```
 
 ```{r stage-density-boxplots}
@@ -1144,31 +1442,231 @@ ggplot(stage_density_long, aes(x = stage_bin, y = value, fill = lineage_id)) +
   facet_wrap(~ covariate, scales = "free_y") +
   scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)]) +
   labs(
-    title = "Confluence and cell count within provisional stage bins",
+    title = "Confluence and cell count within refined stage bins",
     x = "Stage bin",
     y = NULL,
     fill = "Lineage"
-  )
+  ) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
 ```
 
 Interpretation:
 
-- the strongest support for alignment is when multiple lineages contribute to the same stage bins but reach those bins at different times
-- if stage bins are almost lineage-specific, or if each stage is merely a monotone density bucket, the alignment is likely too simplistic
+- the middle bins are the main target here: they should recover intermediate-growth images rather than splitting the data only into seeded and confluent endpoints
+- if control images now appear in the intermediate bins, the curved latent score is doing something biologically useful that `PC1` was missing
+
+## Candidate Control Images in Intermediate States
+
+This section is the main deliverable of the notebook: it explicitly searches for control-lineage images that plausibly occupy intermediate shared states rather than early or late endpoints.
+
+```{r candidate-control-images}
+control_lineage_id <- infer_control_lineage(latent_tbl, params$control_lineage)
+comparison_lineages <- setdiff(lineage_levels, control_lineage_id)
+
+control_tbl <- latent_tbl %>% filter(as.character(lineage_id) == control_lineage_id)
+comparison_tbl <- latent_tbl %>% filter(as.character(lineage_id) %in% comparison_lineages)
+
+control_time_floor <- quantile(control_tbl$time_since_seeding_days, probs = 0.15, na.rm = TRUE)
+control_confluence_ceiling <- quantile(control_tbl$confluence, probs = 0.90, na.rm = TRUE)
+curve_distance_ceiling <- quantile(latent_tbl$distance_to_curve, probs = 0.75, na.rm = TRUE)
+
+candidate_control_tbl <- control_tbl %>%
+  mutate(
+    centrality = abs(latent_score - 0.5),
+    endpoint_distance = pmin(latent_score, 1 - latent_score)
+  ) %>%
+  filter(
+    intermediate_region,
+    is.finite(time_since_seeding_days),
+    time_since_seeding_days > control_time_floor,
+    is.finite(confluence),
+    confluence < control_confluence_ceiling,
+    is.finite(distance_to_curve),
+    distance_to_curve <= curve_distance_ceiling
+  )
+
+comparison_intermediate_tbl <- comparison_tbl %>%
+  filter(
+    intermediate_region,
+    is.finite(distance_to_curve),
+    distance_to_curve <= curve_distance_ceiling
+  )
+
+nn_feature_cols <- c("latent_score", "PC1", "PC2", "PC3")
+nn_feature_cols <- nn_feature_cols[nn_feature_cols %in% names(latent_tbl)]
+
+latent_scaled_tbl <- latent_tbl
+for (col in nn_feature_cols) {
+  latent_scaled_tbl[[col]] <- as.numeric(scale(latent_scaled_tbl[[col]]))
+}
+
+scaled_query_tbl <- latent_scaled_tbl %>%
+  filter(filename %in% candidate_control_tbl$filename) %>%
+  mutate(.query_order = match(filename, candidate_control_tbl$filename)) %>%
+  arrange(.query_order)
+scaled_target_tbl <- latent_scaled_tbl %>%
+  filter(filename %in% comparison_intermediate_tbl$filename) %>%
+  mutate(.target_order = match(filename, comparison_intermediate_tbl$filename)) %>%
+  arrange(.target_order)
+
+nn_tbl <- nn_match_between_groups(scaled_query_tbl, scaled_target_tbl, nn_feature_cols)
+
+candidate_rank_tbl <- candidate_control_tbl %>%
+  mutate(query_row = row_number()) %>%
+  left_join(nn_tbl, by = "query_row") %>%
+  mutate(
+    matched_filename = comparison_intermediate_tbl$filename[nn_index],
+    matched_lineage = as.character(comparison_intermediate_tbl$lineage_id[nn_index]),
+    matched_time_since_seeding_days = comparison_intermediate_tbl$time_since_seeding_days[nn_index],
+    matched_confluence = comparison_intermediate_tbl$confluence[nn_index],
+    matched_cell_count = comparison_intermediate_tbl$cell_count[nn_index],
+    candidate_priority = rank(centrality, ties.method = "average") + rank(nn_distance, ties.method = "average") + rank(distance_to_curve, ties.method = "average")
+  ) %>%
+  arrange(candidate_priority, nn_distance, centrality) %>%
+  transmute(
+    image_identifier = filename,
+    lineage = as.character(lineage_id),
+    passage = passage_position,
+    time_since_seeding_days,
+    confluence,
+    cell_count,
+    latent_score,
+    distance_to_curve,
+    nearest_oxygen_starved_image = matched_filename,
+    nearest_oxygen_starved_lineage = matched_lineage,
+    nearest_neighbor_distance = nn_distance,
+    nearest_neighbor_time_days = matched_time_since_seeding_days,
+    nearest_neighbor_confluence = matched_confluence,
+    nearest_neighbor_cell_count = matched_cell_count
+  ) %>%
+  slice_head(n = params$candidate_top_n)
+
+knitr::kable(candidate_rank_tbl, digits = 3)
+```
+
+Interpretation:
+
+- these are the control images most plausibly aligned with intermediate states from the oxygen-starved lineages
+- the highest-priority candidates are central along the trajectory, reasonably close to the fitted curve, not immediate post-seeding, and close to intermediate non-control neighbors
+
+## Alignment Views Focused on the Control Lineage
+
+The next plots focus on whether the sparse control images align with intermediate states represented more densely in the oxygen-starved lineages.
+
+```{r control-alignment-plots}
+ggplot(latent_tbl, aes(x = latent_score, y = confluence, color = lineage_id)) +
+  geom_point(alpha = 0.75, size = 2) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8, linewidth = 0.8) +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Confluence versus latent trajectory position",
+    x = "Latent progression score",
+    y = "Confluence",
+    color = "Lineage"
+  )
+
+ggplot(latent_tbl, aes(x = latent_score, y = cell_count, color = lineage_id)) +
+  geom_point(alpha = 0.75, size = 2) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8, linewidth = 0.8) +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Cell count versus latent trajectory position",
+    x = "Latent progression score",
+    y = "Cell count",
+    color = "Lineage"
+  )
+```
+
+```{r control-highlighted-in-pca}
+highlight_tbl <- latent_tbl %>%
+  mutate(
+    highlight_group = case_when(
+      filename %in% candidate_rank_tbl$image_identifier ~ "Top control candidates",
+      as.character(lineage_id) == control_lineage_id ~ "Other control images",
+      intermediate_region ~ "Intermediate non-control images",
+      TRUE ~ "Other images"
+    )
+  )
+
+ggplot(highlight_tbl, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = highlight_group), alpha = 0.75, size = 2.1) +
+  scale_color_manual(
+    values = c(
+      "Top control candidates" = "#C0392B",
+      "Other control images" = "#7F8C8D",
+      "Intermediate non-control images" = "#117864",
+      "Other images" = "#D5D8DC"
+    )
+  ) +
+  labs(
+    title = "Candidate control images highlighted in PCA space",
+    subtitle = "This plot asks whether the top control candidates sit among intermediate images from the other lineages",
+    x = "PC1",
+    y = "PC2",
+    color = NULL
+  )
+```
+
+## Representative Images for Manual Review
+
+If raw image paths are available, it is useful to review examples ordered by latent score. This chunk at minimum exports representative image identifiers for later inspection, with extra emphasis on the middle of the trajectory.
+
+```{r representative-images}
+representative_image_tbl <- latent_tbl %>%
+  mutate(
+    representative_group = case_when(
+      latent_score <= quantile(latent_score, probs = 0.10, na.rm = TRUE) ~ "Early endpoint",
+      latent_score >= quantile(latent_score, probs = 0.90, na.rm = TRUE) ~ "Late endpoint",
+      intermediate_region ~ "Intermediate region",
+      TRUE ~ "Transition"
+    ),
+    target_score = case_when(
+      representative_group == "Early endpoint" ~ 0.08,
+      representative_group == "Intermediate region" ~ 0.50,
+      representative_group == "Late endpoint" ~ 0.92,
+      TRUE ~ 0.30
+    ),
+    score_distance = abs(latent_score - target_score)
+  ) %>%
+  group_by(representative_group, lineage_id) %>%
+  slice_min(order_by = score_distance, n = 3, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    representative_group,
+    lineage_id,
+    filename,
+    passage_position,
+    time_since_seeding_days,
+    confluence,
+    cell_count,
+    latent_score,
+    distance_to_curve,
+    any_of(c("filepath", "source_filepath"))
+  ) %>%
+  arrange(representative_group, lineage_id, latent_score)
+
+knitr::kable(representative_image_tbl, digits = 3)
+```
+
+Interpretation:
+
+- this table is meant for direct manual image review around the endpoints and especially around the intermediate region
+- if the candidate control images also look morphologically intermediate by eye, that is strong practical support for the refined trajectory
 
 ## Provisional Conclusions
 
 This notebook intentionally stops short of a production trajectory model. At this stage, the main outputs to trust are:
 
-1. the coverage plots
-2. the PCA geometry and smooth trajectories
-3. the latent-score versus time and density diagnostics
-4. the stage-bin composition and timing plots
+1. the curvature diagnostics in `PC1-PC2` and `PC1-PC3`
+2. the principal-curve arc-length score and distance-to-curve diagnostic
+3. the latent-score versus time and density checks
+4. the refined middle-resolving stage bins
+5. the ranked control-image candidate table and highlighted PCA views
 
 Reasonable next steps depend on what these diagnostics show:
 
-- If the lineages overlap strongly in PCA space and differ mainly by time-to-stage, a more formal alignment model may be worthwhile.
-- If progression remains after density adjustment but different lineages follow visibly different paths, the right next step is likely lineage-specific trajectory modeling rather than forced alignment.
-- If most structure disappears after accounting for `confluence` and `cell_count`, then the embedding is probably acting more as a density summary than as a richer morphology descriptor.
+- If the curved trajectory resolves intermediate control images that align closely with intermediate oxygen-starved images, then the shared-trajectory interpretation is biologically useful.
+- If control images still collapse almost entirely into endpoint regions even after curvature is modeled, then the issue is likely sparse sampling rather than trajectory parameterization alone.
+- If most of the refined trajectory disappears after accounting for `confluence` and `cell_count`, then the embedding is still behaving mainly as a density summary.
 
-For now, the stage bins in `latent_tbl$stage_bin` are a sensible provisional stratification of comparable image states across the three exemplar lineages.
+The most important practical output is `candidate_rank_tbl`: it is the notebook's current best answer to which control-lineage images most plausibly correspond to intermediate morphological states along the shared trajectory.
