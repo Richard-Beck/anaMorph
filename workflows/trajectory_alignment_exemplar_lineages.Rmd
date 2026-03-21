@@ -1139,6 +1139,17 @@ if (has_princurve) {
     )
 }
 
+# Normalize the curve table schema so downstream plots never see a malformed object.
+if (!exists("curve_path_tbl") ||
+    !is.data.frame(curve_path_tbl) ||
+    !all(c("PC1", "PC2", "lambda") %in% names(curve_path_tbl))) {
+  curve_path_tbl <- tibble(
+    PC1 = numeric(),
+    PC2 = numeric(),
+    lambda = numeric()
+  )
+}
+
 latent_method_tbl <- tibble(
   chosen_method = unique(latent_tbl$latent_score_method),
   curve_basis = unique(latent_tbl$curve_basis),
