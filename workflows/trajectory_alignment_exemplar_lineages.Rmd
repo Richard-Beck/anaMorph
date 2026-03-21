@@ -469,7 +469,11 @@ infer_control_lineage <- function(df, requested_control = NULL) {
 
 nn_match_between_groups <- function(query_tbl, target_tbl, feature_cols) {
   if (!nrow(query_tbl) || !nrow(target_tbl)) {
-    return(tibble())
+    return(tibble(
+      query_row = integer(),
+      nn_index = integer(),
+      nn_distance = double()
+    ))
   }
 
   query_mat <- as.matrix(query_tbl[, feature_cols])
@@ -1037,9 +1041,12 @@ Interpretation:
 
 ## Derive a Refined Latent Progression Score
 
-The straight-axis baseline is still useful, but the refined trajectory analysis now treats `PC1` as a comparator rather than the default.
+The straight-axis baseline is still useful, but the notebook now defines one explicit main latent variable:
 
-The main candidate latent variable is arc length along a principal curve fit in `PC1-PC2-PC3` space when available, or `PC1-PC2` if only two PCs are informative. The fitted curve also provides a distance-to-curve diagnostic, which helps distinguish on-trajectory progression from outlying images.
+- baseline comparator: oriented `PC1`
+- main latent trajectory: arc length along one shared principal curve fit in `PC1-PC2` across all lineages
+
+This keeps the trajectory interpretable and visible in the same 2D PCA space used throughout the notebook. `PC3` remains a curvature diagnostic, but the default staging variable is the shared `PC1-PC2` curve score rather than `PC1` alone.
 
 ```{r latent-score}
 pc1_oriented <- score_tbl$PC1
@@ -1047,8 +1054,7 @@ if (stats::cor(pc1_oriented, score_tbl$time_since_seeding_days, use = "pairwise.
   pc1_oriented <- -pc1_oriented
 }
 
-curve_feature_cols <- c("PC1", "PC2", "PC3")
-curve_feature_cols <- curve_feature_cols[curve_feature_cols %in% names(score_tbl)]
+curve_feature_cols <- c("PC1", "PC2")
 
 latent_tbl <- score_tbl %>%
   mutate(
@@ -1063,7 +1069,9 @@ latent_tbl <- score_tbl %>%
 curve_diag_tbl <- curve_diag_tbl %>%
   mutate(curved_trajectory_warranted = FALSE)
 
-if (has_princurve && length(curve_feature_cols) >= 2) {
+curve_path_tbl <- tibble()
+
+if (has_princurve) {
   curve_input <- as.matrix(score_tbl[, curve_feature_cols])
   principal_curve_fit <- princurve::principal_curve(curve_input)
 
@@ -1085,8 +1093,7 @@ if (has_princurve && length(curve_feature_cols) >= 2) {
   curved_trajectory_warranted <- is.finite(path_length_ratio) &&
     (
       path_length_ratio > 1.08 ||
-      (("nonlinear_gain_pc2_on_pc1" %in% names(curve_diag_tbl)) && curve_diag_tbl$nonlinear_gain_pc2_on_pc1[[1]] > 0.05) ||
-      (("nonlinear_gain_pc3_on_pc1" %in% names(curve_diag_tbl)) && curve_diag_tbl$nonlinear_gain_pc3_on_pc1[[1]] > 0.03)
+      (("nonlinear_gain_pc2_on_pc1" %in% names(curve_diag_tbl)) && curve_diag_tbl$nonlinear_gain_pc2_on_pc1[[1]] > 0.05)
     )
 
   latent_tbl <- latent_tbl %>%
@@ -1101,10 +1108,17 @@ if (has_princurve && length(curve_feature_cols) >= 2) {
       mutate(
         latent_score = latent_score_curve,
         latent_arc_length = latent_arc_length_curve,
-        latent_score_method = "principal_curve_arc_length",
-        curve_basis = paste(curve_feature_cols, collapse = " + ")
+        latent_score_method = "shared_principal_curve_arc_length",
+        curve_basis = "PC1 + PC2"
       )
   }
+
+  curve_path_tbl <- tibble(
+    PC1 = principal_curve_fit$s[, 1],
+    PC2 = principal_curve_fit$s[, 2],
+    lambda = curve_lambda
+  ) %>%
+    arrange(lambda)
 
   curve_diag_tbl <- curve_diag_tbl %>%
     mutate(
@@ -1136,8 +1150,23 @@ knitr::kable(curve_diag_tbl, digits = 3)
 
 Interpretation:
 
-- if the principal-curve score is chosen, that means the notebook found enough geometric curvature to justify moving beyond `PC1`
-- the main diagnostics to watch are the path-length ratio, the nonlinear gains from `PC2` and `PC3`, and the distance-to-curve distribution
+- the main staging variable used below is `latent_tbl$latent_score`
+- if the chosen method is `shared_principal_curve_arc_length`, then every downstream alignment and stage plot is based on distance along one shared curved path in `PC1-PC2`
+- the main diagnostics to watch are the path-length ratio, the nonlinear gain in `PC2`, and the distance-to-curve distribution
+
+```{r shared-curve-in-pca}
+ggplot(latent_tbl, aes(x = PC1, y = PC2, color = latent_score)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_path(data = curve_path_tbl, aes(x = PC1, y = PC2), inherit.aes = FALSE, linewidth = 1.3, color = "black") +
+  scale_color_viridis_c(option = "C", na.value = "grey80") +
+  labs(
+    title = "Shared curved trajectory in PC1-PC2 space",
+    subtitle = paste("Main latent score:", unique(latent_tbl$latent_score_method)),
+    x = "PC1",
+    y = "PC2",
+    color = "Latent score"
+  )
+```
 
 ## Straight-Axis Versus Curved Progression
 
@@ -1365,81 +1394,81 @@ Interpretation:
 - if lineages have similar stage ordering but systematically different times-to-stage, that supports the idea of shared morphology traversed at different rates
 - if the curves cross erratically or cannot be estimated for large parts of the score range, the notion of one shared progression is weaker
 
-## Refined Morphological Stage Bins
+## Trajectory Zones for Interpretability
 
-The stage bins are now chosen to give extra resolution in the middle of the trajectory instead of defaulting to a crude endpoint split.
+Instead of creating many narrow bins, the notebook now defines a small number of trajectory zones anchored on the shared curve:
+
+- `Early / Seeded`
+- `Intermediate`
+- `Late / Near-Confluent`
+
+The middle zone is intentionally broad enough to isolate biologically interesting intermediate states without collapsing them into endpoint structure.
 
 ```{r stage-bins}
-stage_probs <- c(0, 0.12, 0.30, 0.42, 0.58, 0.70, 0.88, 1)
-stage_breaks <- unique(quantile(latent_tbl$latent_score, probs = stage_probs, na.rm = TRUE))
-if (length(stage_breaks) < 4) {
-  stop("Latent score does not have enough spread to define refined stage bins.", call. = FALSE)
-}
-
-stage_labels <- c(
-  "Early / Seeded",
-  "Early Growth",
-  "Intermediate A",
-  "Intermediate Core",
-  "Intermediate B",
-  "Late Growth",
-  "Late / Near-Confluent"
-)[seq_len(length(stage_breaks) - 1)]
+early_cut <- quantile(latent_tbl$latent_score, probs = 0.20, na.rm = TRUE)
+late_cut <- quantile(latent_tbl$latent_score, probs = 0.80, na.rm = TRUE)
+core_lo <- quantile(latent_tbl$latent_score, probs = 0.35, na.rm = TRUE)
+core_hi <- quantile(latent_tbl$latent_score, probs = 0.65, na.rm = TRUE)
 
 latent_tbl <- latent_tbl %>%
   mutate(
-    stage_bin = cut(
-      latent_score,
-      breaks = stage_breaks,
-      include.lowest = TRUE,
-      labels = stage_labels
+    trajectory_zone = case_when(
+      latent_score <= early_cut ~ "Early / Seeded",
+      latent_score >= late_cut ~ "Late / Near-Confluent",
+      TRUE ~ "Intermediate"
     ),
-    intermediate_region = latent_score >= quantile(latent_score, probs = 0.30, na.rm = TRUE) &
-      latent_score <= quantile(latent_score, probs = 0.70, na.rm = TRUE)
+    intermediate_region = latent_score >= core_lo & latent_score <= core_hi
   )
 ```
 
 ```{r stage-in-pca}
-ggplot(latent_tbl, aes(x = PC1, y = PC2, color = stage_bin)) +
+ggplot(latent_tbl, aes(x = PC1, y = PC2, color = trajectory_zone)) +
   geom_point(alpha = 0.85, size = 2.1) +
-  scale_color_brewer(palette = "Spectral", direction = -1, na.value = "grey80") +
+  geom_path(data = curve_path_tbl, aes(x = PC1, y = PC2), inherit.aes = FALSE, linewidth = 1.2, color = "black") +
+  scale_color_manual(
+    values = c(
+      "Early / Seeded" = "#2C7BB6",
+      "Intermediate" = "#D95F02",
+      "Late / Near-Confluent" = "#1A9850"
+    )
+  ) +
   labs(
-    title = "Refined stage bins mapped onto PCA state space",
-    subtitle = "The middle of the trajectory is intentionally given more resolution",
+    title = "Trajectory zones mapped onto the shared curve in PC1-PC2 space",
+    subtitle = "These zones are derived from arc length along the shared curved path, not from PC1 thresholds alone",
     x = "PC1",
     y = "PC2",
-    color = "Stage bin"
+    color = "Trajectory zone"
   )
 ```
 
 ```{r stage-composition}
 stage_comp_tbl <- latent_tbl %>%
-  dplyr::count(stage_bin, lineage_id, name = "n_images") %>%
-  group_by(stage_bin) %>%
+  dplyr::count(trajectory_zone, lineage_id, name = "n_images") %>%
+  group_by(trajectory_zone) %>%
   mutate(stage_fraction = n_images / sum(n_images)) %>%
   ungroup()
 
-ggplot(stage_comp_tbl, aes(x = stage_bin, y = stage_fraction, fill = lineage_id)) +
+ggplot(stage_comp_tbl, aes(x = trajectory_zone, y = stage_fraction, fill = lineage_id)) +
   geom_col(position = "stack", color = "white") +
   scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)]) +
   scale_y_continuous(labels = percent_format(accuracy = 1)) +
   labs(
-    title = "Lineage composition within refined morphological stage bins",
-    x = "Stage bin",
-    y = "Fraction of images in bin",
+    title = "Lineage composition within shared trajectory zones",
+    x = "Trajectory zone",
+    y = "Fraction of images in zone",
     fill = "Lineage"
   ) +
   theme(axis.text.x = element_text(angle = 25, hjust = 1))
 ```
 
 ```{r stage-time-boxplots}
-ggplot(latent_tbl, aes(x = stage_bin, y = time_since_seeding_days, fill = lineage_id)) +
+ggplot(latent_tbl, aes(x = trajectory_zone, y = time_since_seeding_days, fill = lineage_id)) +
   geom_boxplot(alpha = 0.8, outlier.alpha = 0.35, position = position_dodge(width = 0.8)) +
   scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)]) +
   labs(
-    title = "Time since seeding within refined stage bins",
+    title = "Time since seeding within shared trajectory zones",
     subtitle = "Comparable intermediate stages should be populated at different times across lineages",
-    x = "Stage bin",
+    x = "Trajectory zone",
     y = "Time since seeding (days)",
     fill = "Lineage"
   ) +
@@ -1448,16 +1477,16 @@ ggplot(latent_tbl, aes(x = stage_bin, y = time_since_seeding_days, fill = lineag
 
 ```{r stage-density-boxplots}
 stage_density_long <- latent_tbl %>%
-  select(stage_bin, lineage_id, confluence, cell_count) %>%
+  select(trajectory_zone, lineage_id, confluence, cell_count) %>%
   pivot_longer(cols = c(confluence, cell_count), names_to = "covariate", values_to = "value")
 
-ggplot(stage_density_long, aes(x = stage_bin, y = value, fill = lineage_id)) +
+ggplot(stage_density_long, aes(x = trajectory_zone, y = value, fill = lineage_id)) +
   geom_boxplot(alpha = 0.8, outlier.alpha = 0.3, position = position_dodge(width = 0.8)) +
   facet_wrap(~ covariate, scales = "free_y") +
   scale_fill_manual(values = lineage_palette[seq_along(lineage_levels)]) +
   labs(
-    title = "Confluence and cell count within refined stage bins",
-    x = "Stage bin",
+    title = "Confluence and cell count within shared trajectory zones",
+    x = "Trajectory zone",
     y = NULL,
     fill = "Lineage"
   ) +
@@ -1466,7 +1495,7 @@ ggplot(stage_density_long, aes(x = stage_bin, y = value, fill = lineage_id)) +
 
 Interpretation:
 
-- the middle bins are the main target here: they should recover intermediate-growth images rather than splitting the data only into seeded and confluent endpoints
+- the `Intermediate` zone is the main target here: it should recover intermediate-growth images rather than splitting the data only into seeded and confluent endpoints
 - if control images now appear in the intermediate bins, the curved latent score is doing something biologically useful that `PC1` was missing
 
 ## Candidate Control Images in Intermediate States
@@ -1525,35 +1554,54 @@ scaled_target_tbl <- latent_scaled_tbl %>%
 
 nn_tbl <- nn_match_between_groups(scaled_query_tbl, scaled_target_tbl, nn_feature_cols)
 
-candidate_rank_tbl <- candidate_control_tbl %>%
-  mutate(query_row = row_number()) %>%
-  left_join(nn_tbl, by = "query_row") %>%
-  mutate(
-    matched_filename = comparison_intermediate_tbl$filename[nn_index],
-    matched_lineage = as.character(comparison_intermediate_tbl$lineage_id[nn_index]),
-    matched_time_since_seeding_days = comparison_intermediate_tbl$time_since_seeding_days[nn_index],
-    matched_confluence = comparison_intermediate_tbl$confluence[nn_index],
-    matched_cell_count = comparison_intermediate_tbl$cell_count[nn_index],
-    candidate_priority = rank(centrality, ties.method = "average") + rank(nn_distance, ties.method = "average") + rank(distance_to_curve, ties.method = "average")
-  ) %>%
-  arrange(candidate_priority, nn_distance, centrality) %>%
-  transmute(
-    image_identifier = filename,
-    lineage = as.character(lineage_id),
-    passage = passage_position,
-    time_since_seeding_days,
-    confluence,
-    cell_count,
-    latent_score,
-    distance_to_curve,
-    nearest_oxygen_starved_image = matched_filename,
-    nearest_oxygen_starved_lineage = matched_lineage,
-    nearest_neighbor_distance = nn_distance,
-    nearest_neighbor_time_days = matched_time_since_seeding_days,
-    nearest_neighbor_confluence = matched_confluence,
-    nearest_neighbor_cell_count = matched_cell_count
-  ) %>%
-  slice_head(n = params$candidate_top_n)
+if (!nrow(candidate_control_tbl)) {
+  candidate_rank_tbl <- tibble(
+    image_identifier = character(),
+    lineage = character(),
+    passage = integer(),
+    time_since_seeding_days = double(),
+    confluence = double(),
+    cell_count = double(),
+    latent_score = double(),
+    distance_to_curve = double(),
+    nearest_oxygen_starved_image = character(),
+    nearest_oxygen_starved_lineage = character(),
+    nearest_neighbor_distance = double(),
+    nearest_neighbor_time_days = double(),
+    nearest_neighbor_confluence = double(),
+    nearest_neighbor_cell_count = double()
+  )
+} else {
+  candidate_rank_tbl <- candidate_control_tbl %>%
+    mutate(query_row = row_number()) %>%
+    left_join(nn_tbl, by = "query_row") %>%
+    mutate(
+      matched_filename = dplyr::if_else(is.finite(nn_index), comparison_intermediate_tbl$filename[nn_index], NA_character_),
+      matched_lineage = dplyr::if_else(is.finite(nn_index), as.character(comparison_intermediate_tbl$lineage_id[nn_index]), NA_character_),
+      matched_time_since_seeding_days = dplyr::if_else(is.finite(nn_index), comparison_intermediate_tbl$time_since_seeding_days[nn_index], NA_real_),
+      matched_confluence = dplyr::if_else(is.finite(nn_index), comparison_intermediate_tbl$confluence[nn_index], NA_real_),
+      matched_cell_count = dplyr::if_else(is.finite(nn_index), comparison_intermediate_tbl$cell_count[nn_index], NA_real_),
+      candidate_priority = rank(centrality, ties.method = "average") + rank(dplyr::coalesce(nn_distance, Inf), ties.method = "average") + rank(distance_to_curve, ties.method = "average")
+    ) %>%
+    arrange(candidate_priority, nn_distance, centrality) %>%
+    transmute(
+      image_identifier = filename,
+      lineage = as.character(lineage_id),
+      passage = passage_position,
+      time_since_seeding_days,
+      confluence,
+      cell_count,
+      latent_score,
+      distance_to_curve,
+      nearest_oxygen_starved_image = matched_filename,
+      nearest_oxygen_starved_lineage = matched_lineage,
+      nearest_neighbor_distance = nn_distance,
+      nearest_neighbor_time_days = matched_time_since_seeding_days,
+      nearest_neighbor_confluence = matched_confluence,
+      nearest_neighbor_cell_count = matched_cell_count
+    ) %>%
+    slice_head(n = params$candidate_top_n)
+}
 
 knitr::kable(candidate_rank_tbl, digits = 3)
 ```
