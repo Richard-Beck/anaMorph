@@ -1159,9 +1159,8 @@ Interpretation:
 - the main diagnostics to watch are the path-length ratio, the nonlinear gain in `PC2`, and the distance-to-curve distribution
 
 ```{r shared-curve-in-pca}
-ggplot(latent_tbl, aes(x = PC1, y = PC2, color = latent_score)) +
+shared_curve_plot <- ggplot(latent_tbl, aes(x = PC1, y = PC2, color = latent_score)) +
   geom_point(size = 2, alpha = 0.8) +
-  geom_path(data = curve_path_tbl, aes(x = PC1, y = PC2), inherit.aes = FALSE, linewidth = 1.3, color = "black") +
   scale_color_viridis_c(option = "C", na.value = "grey80") +
   labs(
     title = "Shared curved trajectory in PC1-PC2 space",
@@ -1170,6 +1169,22 @@ ggplot(latent_tbl, aes(x = PC1, y = PC2, color = latent_score)) +
     y = "PC2",
     color = "Latent score"
   )
+
+if (exists("curve_path_tbl") &&
+    is.data.frame(curve_path_tbl) &&
+    all(c("PC1", "PC2") %in% names(curve_path_tbl)) &&
+    nrow(curve_path_tbl) >= 2) {
+  shared_curve_plot <- shared_curve_plot +
+    geom_path(
+      data = curve_path_tbl,
+      mapping = aes(x = PC1, y = PC2),
+      inherit.aes = FALSE,
+      linewidth = 1.3,
+      color = "black"
+    )
+}
+
+shared_curve_plot
 ```
 
 ## Straight-Axis Versus Curved Progression
@@ -1426,9 +1441,8 @@ latent_tbl <- latent_tbl %>%
 ```
 
 ```{r stage-in-pca}
-ggplot(latent_tbl, aes(x = PC1, y = PC2, color = trajectory_zone)) +
+stage_pca_plot <- ggplot(latent_tbl, aes(x = PC1, y = PC2, color = trajectory_zone)) +
   geom_point(alpha = 0.85, size = 2.1) +
-  geom_path(data = curve_path_tbl, aes(x = PC1, y = PC2), inherit.aes = FALSE, linewidth = 1.2, color = "black") +
   scale_color_manual(
     values = c(
       "Early / Seeded" = "#2C7BB6",
@@ -1443,6 +1457,22 @@ ggplot(latent_tbl, aes(x = PC1, y = PC2, color = trajectory_zone)) +
     y = "PC2",
     color = "Trajectory zone"
   )
+
+if (exists("curve_path_tbl") &&
+    is.data.frame(curve_path_tbl) &&
+    all(c("PC1", "PC2") %in% names(curve_path_tbl)) &&
+    nrow(curve_path_tbl) >= 2) {
+  stage_pca_plot <- stage_pca_plot +
+    geom_path(
+      data = curve_path_tbl,
+      mapping = aes(x = PC1, y = PC2),
+      inherit.aes = FALSE,
+      linewidth = 1.2,
+      color = "black"
+    )
+}
+
+stage_pca_plot
 ```
 
 ```{r stage-composition}
