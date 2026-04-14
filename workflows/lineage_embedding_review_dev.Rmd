@@ -1,0 +1,1086 @@
+---
+title: "Lineage Embedding Review Dev"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  lineage_ids_csv: "manual_1,manual_2,manual_3"
+  control_lineage_id: "manual_3"
+  lineage_rds: "core_data/lineages.Rds"
+  segmentation_manifest: "data/all_images/manifests/segmentation_images.csv"
+  embedding_dir: "data/all_images/embeddings"
+  cell_count_min: 500
+  cell_count_max: 1200
+  n_pcs: 50
+  max_umap_cells: 10000
+  umap_neighbors: 20
+  umap_min_dist: 0.15
+  seed: 1
+  cache_dir: "/tmp/lineage_embedding_review_dev_cache"
+  refresh_cache: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+## Overview
+
+This notebook builds a pooled embedding view across selected lineages directly from the raw per-object embedding CSVs.
+
+Workflow:
+
+1. Resolve all lineage images for the requested lineages.
+2. Load per-object embedding tables for those images.
+3. Keep only images with between `r params$cell_count_min` and `r params$cell_count_max` cells.
+4. Run one pooled PCA across all retained cells using `embedding_*` features.
+5. Downsample to at most `r format(params$max_umap_cells, big.mark = ",")` cells for UMAP.
+6. Build balanced-subsample UMAP summaries, differential density views, and targeted PC comparisons.
+
+This document can cache PCA and UMAP intermediates under `r params$cache_dir` to speed up repeated renders.
+
+## Packages
+
+```{r packages, include=FALSE}
+required_packages <- c(
+  "data.table",
+  "dplyr",
+  "ggplot2",
+  "purrr",
+  "readr",
+  "stringr",
+  "tibble",
+  "tidyr",
+  "scales",
+  "uwot"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    sprintf(
+      "Install required packages before rendering: %s",
+      paste(missing_packages, collapse = ", ")
+    ),
+    call. = FALSE
+  )
+}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(readr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(scales)
+```
+
+## Helpers
+
+```{r helpers, include=FALSE}
+resolve_project_root <- function() {
+  candidates <- c(
+    normalizePath(".", winslash = "/", mustWork = FALSE),
+    normalizePath("..", winslash = "/", mustWork = FALSE),
+    normalizePath("../..", winslash = "/", mustWork = FALSE)
+  )
+
+  for (candidate in unique(candidates)) {
+    if (file.exists(file.path(candidate, "README.md")) &&
+        dir.exists(file.path(candidate, "workflows")) &&
+        dir.exists(file.path(candidate, "core_data"))) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate project root from current working directory.", call. = FALSE)
+}
+
+project_root <- resolve_project_root()
+
+project_path <- function(path) {
+  is_absolute <- grepl("^[A-Za-z]:[/\\\\]|^/", path)
+  out <- path
+  out[!is_absolute] <- file.path(project_root, path[!is_absolute])
+  out
+}
+
+normalize_relpath <- function(path) {
+  gsub("\\\\", "/", path)
+}
+
+cache_dir <- project_path(params$cache_dir)
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+cache_stub <- function(...) {
+  raw <- paste(..., sep = "__")
+  gsub("[^A-Za-z0-9._-]+", "_", raw)
+}
+
+cache_path <- function(name) {
+  file.path(
+    cache_dir,
+    paste0(
+      cache_stub(
+        params$lineage_ids_csv,
+        params$control_lineage_id,
+        params$cell_count_min,
+        params$cell_count_max,
+        params$n_pcs,
+        params$max_umap_cells,
+        params$umap_neighbors,
+        params$umap_min_dist
+      ),
+      "__",
+      name
+    )
+  )
+}
+
+safe_readRDS <- function(path) {
+  if (!file.exists(path)) {
+    return(NULL)
+  }
+
+  tryCatch(
+    readRDS(path),
+    error = function(e) {
+      message(sprintf("Ignoring unreadable cache file: %s", path))
+      unlink(path)
+      NULL
+    }
+  )
+}
+
+safe_saveRDS <- function(object, path) {
+  tmp_path <- sprintf("%s.tmp.%s", path, Sys.getpid())
+  on.exit(unlink(tmp_path), add = TRUE)
+  saveRDS(object, tmp_path)
+  ok <- file.rename(tmp_path, path)
+  if (!ok) {
+    file.copy(tmp_path, path, overwrite = TRUE)
+    unlink(tmp_path)
+  }
+  invisible(path)
+}
+
+parse_lineage_ids <- function(x) {
+  str_split(x, ",", simplify = TRUE) %>%
+    as.vector() %>%
+    str_trim() %>%
+    .[nzchar(.)]
+}
+
+extract_lineage <- function(lineages, lineage_id) {
+  if (lineage_id %in% names(lineages)) {
+    return(lineages[[lineage_id]])
+  }
+
+  hit <- vapply(
+    lineages,
+    function(x) identical(as.character(x$lineage_id), as.character(lineage_id)),
+    logical(1)
+  )
+  if (!any(hit)) {
+    stop(sprintf("Lineage id not found: %s", lineage_id), call. = FALSE)
+  }
+
+  lineages[[which(hit)[[1]]]]
+}
+
+build_lineage_image_meta <- function(lineage_obj) {
+  passage_positions <- stats::setNames(seq_along(lineage_obj$passage_ids), lineage_obj$passage_ids)
+
+  meta_list <- lapply(names(lineage_obj$passages), function(passage_id) {
+    current_passage_id <- as.character(passage_id)
+    current_passage_number <- as.integer(passage_positions[[current_passage_id]])
+    passage_dt <- data.table::as.data.table(lineage_obj$passages[[current_passage_id]])
+    if (!nrow(passage_dt)) {
+      return(NULL)
+    }
+
+    out <- data.table::copy(passage_dt)
+    keep_cols <- intersect(c("id", "filename", "filepath", "field", "date"), names(out))
+    keep_dt <- out[, ..keep_cols]
+    keep_dt[, image_id := if ("filename" %in% names(keep_dt)) {
+      ifelse(!is.na(filename) & nzchar(filename), as.character(filename), as.character(id))
+    } else {
+      as.character(id)
+    }]
+    keep_dt[, passage_id := current_passage_id]
+    keep_dt[, passage_number := current_passage_number]
+    keep_dt
+  })
+
+  meta_dt <- data.table::rbindlist(meta_list, use.names = TRUE, fill = TRUE)
+  meta_dt[, id := as.character(id)]
+  if ("filename" %in% names(meta_dt)) {
+    meta_dt[, filename := as.character(filename)]
+  }
+  unique(meta_dt, by = intersect(c("image_id", "filename", "passage_id"), names(meta_dt)))
+}
+
+candidate_embedding_paths <- function(embedding_dir, image_id, filename = NA_character_) {
+  stems <- unique(stats::na.omit(c(
+    as.character(image_id),
+    tools::file_path_sans_ext(basename(as.character(filename)))
+  )))
+  file.path(embedding_dir, paste0(stems, "_embeddings.csv"))
+}
+
+match_segmentation_row <- function(seg_dt, row) {
+  seg_row <- NULL
+
+  if ("filename" %in% names(seg_dt) && "filename" %in% names(row)) {
+    seg_row <- seg_dt[filename == row$filename[[1]]]
+    if (nrow(seg_row)) return(seg_row[1])
+  }
+
+  if ("source_filepath" %in% names(seg_dt) && "filepath" %in% names(row)) {
+    seg_row <- seg_dt[source_filepath == row$filepath[[1]]]
+    if (nrow(seg_row)) return(seg_row[1])
+  }
+
+  if ("source_basename" %in% names(seg_dt) && "filepath" %in% names(row)) {
+    seg_row <- seg_dt[source_basename == basename(row$filepath[[1]])]
+    if (nrow(seg_row)) return(seg_row[1])
+  }
+
+  if ("id" %in% names(seg_dt)) {
+    seg_row <- seg_dt[id == row$id[[1]]]
+    if (nrow(seg_row)) return(seg_row[1])
+  }
+
+  NULL
+}
+
+resolve_embedding_meta <- function(image_meta, seg_dt, embedding_dir, lineage_id) {
+  resolved_list <- lapply(seq_len(nrow(image_meta)), function(i) {
+    row <- image_meta[i]
+    seg_row <- match_segmentation_row(seg_dt, row)
+
+    embedding_path <- NA_character_
+
+    if (!is.null(seg_row) && nrow(seg_row)) {
+      if ("embedding_relpath" %in% names(seg_row) && file.exists(seg_row$embedding_relpath[[1]])) {
+        embedding_path <- seg_row$embedding_relpath[[1]]
+      }
+    }
+
+    if (!isTRUE(nzchar(embedding_path)) || is.na(embedding_path)) {
+      candidates <- candidate_embedding_paths(
+        embedding_dir = embedding_dir,
+        image_id = row$image_id[[1]],
+        filename = if ("filename" %in% names(row)) row$filename[[1]] else NA_character_
+      )
+      existing <- candidates[file.exists(candidates)]
+      if (length(existing)) {
+        embedding_path <- existing[[1]]
+      }
+    }
+
+    data.table(
+      lineage_id = lineage_id,
+      image_id = as.character(row$image_id[[1]]),
+      id = as.character(row$id[[1]]),
+      filename = if ("filename" %in% names(row)) as.character(row$filename[[1]]) else NA_character_,
+      field = if ("field" %in% names(row)) as.character(row$field[[1]]) else NA_character_,
+      filepath = if ("filepath" %in% names(row)) as.character(row$filepath[[1]]) else NA_character_,
+      date = if ("date" %in% names(row)) as.character(row$date[[1]]) else NA_character_,
+      passage_id = as.character(row$passage_id[[1]]),
+      passage_number = as.integer(row$passage_number[[1]]),
+      embedding_path = embedding_path
+    )
+  })
+
+  resolved_dt <- rbindlist(resolved_list, use.names = TRUE, fill = TRUE)
+  resolved_dt[order(lineage_id, image_id, passage_number)][, .SD[1], by = .(lineage_id, image_id)]
+}
+
+load_embedding_table <- function(meta_row) {
+  path <- meta_row$embedding_path[[1]]
+  if (is.na(path) || !nzchar(path) || !file.exists(path)) {
+    return(NULL)
+  }
+
+  dt <- data.table::fread(path)
+  emb_cols <- grep("^embedding_[0-9]{3}$", names(dt), value = TRUE)
+  if (!length(emb_cols)) {
+    stop(sprintf("No embedding columns found in %s", path), call. = FALSE)
+  }
+
+  keep_cols <- unique(c("label", "log1p_area", emb_cols))
+  keep_cols <- intersect(keep_cols, names(dt))
+  dt <- dt[, ..keep_cols]
+  dt[, lineage_id := meta_row$lineage_id[[1]]]
+  dt[, image_id := meta_row$image_id[[1]]]
+  dt[, id := meta_row$id[[1]]]
+  dt[, filename := meta_row$filename[[1]]]
+  dt[, field := meta_row$field[[1]]]
+  dt[, date := meta_row$date[[1]]]
+  dt[, passage_id := meta_row$passage_id[[1]]]
+  dt[, passage_number := meta_row$passage_number[[1]]]
+  dt
+}
+
+plot_umap <- function(df, color_col, title, discrete = FALSE, point_alpha = 0.6) {
+  p <- ggplot(df, aes(x = UMAP1, y = UMAP2, color = .data[[color_col]])) +
+    geom_point(size = 0.35, alpha = point_alpha) +
+    labs(
+      title = title,
+      x = "UMAP1",
+      y = "UMAP2",
+      color = color_col
+    ) +
+    theme_bw(base_size = 11)
+
+  if (discrete) {
+    p + guides(color = guide_legend(override.aes = list(size = 2, alpha = 1)))
+  } else {
+    p + scale_color_viridis_c(option = "C")
+  }
+}
+
+plot_binned_embedding <- function(df, x_col, y_col, title, facet_col = NULL, bins = 55) {
+  p <- ggplot(df, aes(x = .data[[x_col]], y = .data[[y_col]])) +
+    stat_bin_2d(bins = bins) +
+    scale_fill_viridis_c(option = "C", trans = "sqrt") +
+    labs(
+      title = title,
+      x = x_col,
+      y = y_col,
+      fill = "Cells/bin"
+    ) +
+    coord_equal() +
+    theme_bw(base_size = 11)
+
+  if (!is.null(facet_col)) {
+    p <- p + facet_wrap(stats::as.formula(paste("~", facet_col)))
+  }
+
+  p
+}
+
+plot_density_contours <- function(df, x_col, y_col, title, facet_col = NULL, bins = 10) {
+  p <- ggplot(df, aes(x = .data[[x_col]], y = .data[[y_col]])) +
+    stat_density_2d_filled(contour_var = "ndensity", bins = bins, alpha = 0.9) +
+    labs(
+      title = title,
+      x = x_col,
+      y = y_col,
+      fill = "Norm. density"
+    ) +
+    coord_equal() +
+    theme_bw(base_size = 11)
+
+  if (!is.null(facet_col)) {
+    p <- p + facet_wrap(stats::as.formula(paste("~", facet_col)))
+  }
+
+  p
+}
+
+compute_binned_density_difference <- function(df, x_col, y_col, group_col, group_a, group_b, bins = 70) {
+  stopifnot(group_a != group_b)
+
+  x_breaks <- seq(min(df[[x_col]], na.rm = TRUE), max(df[[x_col]], na.rm = TRUE), length.out = bins + 1)
+  y_breaks <- seq(min(df[[y_col]], na.rm = TRUE), max(df[[y_col]], na.rm = TRUE), length.out = bins + 1)
+
+  counts <- df %>%
+    filter(.data[[group_col]] %in% c(group_a, group_b)) %>%
+    mutate(
+      x_bin = cut(.data[[x_col]], breaks = x_breaks, include.lowest = TRUE, labels = FALSE),
+      y_bin = cut(.data[[y_col]], breaks = y_breaks, include.lowest = TRUE, labels = FALSE)
+    ) %>%
+    filter(!is.na(x_bin), !is.na(y_bin)) %>%
+    count(.data[[group_col]], x_bin, y_bin, name = "n") %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(density = n / sum(n)) %>%
+    ungroup() %>%
+    select(all_of(group_col), x_bin, y_bin, density)
+
+  density_wide <- counts %>%
+    pivot_wider(names_from = all_of(group_col), values_from = density, values_fill = 0)
+
+  x_mid <- head(x_breaks, -1) + diff(x_breaks) / 2
+  y_mid <- head(y_breaks, -1) + diff(y_breaks) / 2
+
+  density_wide %>%
+    mutate(
+      x = x_mid[x_bin],
+      y = y_mid[y_bin],
+      density_diff = .data[[group_a]] - .data[[group_b]]
+    )
+}
+
+plot_density_difference <- function(df, x_col, y_col, group_col, group_a, group_b, title, bins = 70) {
+  diff_df <- compute_binned_density_difference(df, x_col, y_col, group_col, group_a, group_b, bins = bins)
+
+  ggplot(diff_df, aes(x = x, y = y, fill = density_diff)) +
+    geom_raster() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B") +
+    coord_equal() +
+    labs(
+      title = title,
+      x = x_col,
+      y = y_col,
+      fill = sprintf("%s - %s", group_a, group_b)
+    ) +
+    theme_bw(base_size = 11)
+}
+
+balanced_sample_by_lineage <- function(df, lineage_col = "lineage_id", max_n = 10000, seed = 1) {
+  if (nrow(df) <= max_n) {
+    return(df)
+  }
+
+  set.seed(seed)
+  df <- df %>%
+    mutate(.sample_row_id = row_number())
+
+  lineage_counts <- df %>%
+    count(.data[[lineage_col]], name = "n_cells") %>%
+    arrange(.data[[lineage_col]])
+
+  n_groups <- nrow(lineage_counts)
+  base_quota <- max(1L, floor(max_n / n_groups))
+
+  sampled <- df %>%
+    group_by(.data[[lineage_col]]) %>%
+    group_modify(~ {
+      keep_n <- min(nrow(.x), base_quota)
+      slice_sample(.x, n = keep_n)
+    }) %>%
+    ungroup()
+
+  n_remaining <- max_n - nrow(sampled)
+  if (n_remaining <= 0) {
+    return(sampled %>% select(-.sample_row_id))
+  }
+
+  leftovers <- anti_join(
+    df,
+    sampled %>% select(.sample_row_id),
+    by = ".sample_row_id"
+  )
+
+  if (!nrow(leftovers)) {
+    return(sampled %>% select(-.sample_row_id))
+  }
+
+  sampled_extra <- leftovers %>%
+    group_by(.data[[lineage_col]]) %>%
+    group_modify(~ {
+      if (!nrow(.x)) return(.x[0, , drop = FALSE])
+      keep_n <- min(nrow(.x), ceiling(n_remaining / n_groups))
+      slice_sample(.x, n = keep_n)
+    }) %>%
+    ungroup() %>%
+    slice_head(n = n_remaining)
+
+  bind_rows(sampled, sampled_extra) %>%
+    select(-.sample_row_id)
+}
+
+compute_lineage_pc_separation <- function(df, pc_cols, control_lineage_id) {
+  df <- df %>%
+    mutate(lineage_group = if_else(lineage_id == control_lineage_id, "control", "treated"))
+
+  bind_rows(lapply(pc_cols, function(pc_name) {
+    pc_values <- df[[pc_name]]
+    control_vals <- pc_values[df$lineage_group == "control" & is.finite(pc_values)]
+    treated_vals <- pc_values[df$lineage_group == "treated" & is.finite(pc_values)]
+
+    pooled_sd <- sqrt(mean(c(stats::var(control_vals, na.rm = TRUE), stats::var(treated_vals, na.rm = TRUE)), na.rm = TRUE))
+    pooled_sd <- ifelse(is.finite(pooled_sd) && pooled_sd > 0, pooled_sd, NA_real_)
+
+    tibble(
+      pc = pc_name,
+      control_mean = mean(control_vals, na.rm = TRUE),
+      treated_mean = mean(treated_vals, na.rm = TRUE),
+      mean_diff = mean(treated_vals, na.rm = TRUE) - mean(control_vals, na.rm = TRUE),
+      abs_mean_diff = abs(mean(treated_vals, na.rm = TRUE) - mean(control_vals, na.rm = TRUE)),
+      cohens_d = abs((mean(treated_vals, na.rm = TRUE) - mean(control_vals, na.rm = TRUE)) / pooled_sd)
+    )
+  })) %>%
+    arrange(desc(cohens_d), desc(abs_mean_diff), pc)
+}
+```
+
+## Resolve Selected Images
+
+```{r resolve-images}
+set.seed(params$seed)
+
+lineage_ids <- parse_lineage_ids(params$lineage_ids_csv)
+if (!length(lineage_ids)) {
+  stop("No lineage ids were provided.", call. = FALSE)
+}
+
+lineages <- readRDS(project_path(params$lineage_rds))
+
+seg_dt <- fread(project_path(params$segmentation_manifest))
+if ("id" %in% names(seg_dt)) {
+  seg_dt[, id := as.character(id)]
+}
+if ("filename" %in% names(seg_dt)) {
+  seg_dt[, filename := as.character(filename)]
+}
+if ("source_filepath" %in% names(seg_dt)) {
+  seg_dt[, source_filepath := as.character(source_filepath)]
+  seg_dt[, source_basename := basename(source_filepath)]
+  seg_dt[, source_filepath := project_path(normalize_relpath(source_filepath))]
+}
+for (path_col in intersect(c("raw_relpath", "mask_relpath", "embedding_relpath"), names(seg_dt))) {
+  seg_dt[, (path_col) := project_path(normalize_relpath(get(path_col)))]
+}
+
+embedding_dir <- project_path(params$embedding_dir)
+
+resolved_image_tbl <- map_dfr(lineage_ids, function(lineage_id) {
+  lineage_obj <- extract_lineage(lineages, lineage_id)
+  image_meta <- build_lineage_image_meta(lineage_obj)
+  resolve_embedding_meta(image_meta, seg_dt, embedding_dir, lineage_id) %>%
+    as_tibble()
+})
+
+resolved_image_tbl %>%
+  group_by(lineage_id) %>%
+  summarise(
+    n_images = n(),
+    n_embedding_paths = sum(!is.na(embedding_path) & nzchar(embedding_path) & file.exists(embedding_path)),
+    .groups = "drop"
+  ) %>%
+  knitr::kable()
+```
+
+## Load Embeddings
+
+```{r load-embeddings}
+embedding_load_cache <- cache_path("embedding_load_cache.rds")
+embedding_cache_obj <- NULL
+
+if (file.exists(embedding_load_cache) && !isTRUE(params$refresh_cache)) {
+  embedding_cache_obj <- safe_readRDS(embedding_load_cache)
+}
+
+if (!is.null(embedding_cache_obj) && !isTRUE(params$refresh_cache)) {
+  object_tbl <- embedding_cache_obj$object_tbl
+  embedding_cols <- embedding_cache_obj$embedding_cols
+  image_cell_summary <- embedding_cache_obj$image_cell_summary
+  lineage_load_summary <- embedding_cache_obj$lineage_load_summary
+} else {
+  object_tbl <- map_dfr(seq_len(nrow(resolved_image_tbl)), function(i) {
+    load_embedding_table(as.data.table(resolved_image_tbl[i, , drop = FALSE])) %>%
+      as_tibble()
+  })
+
+  if (!nrow(object_tbl)) {
+    stop("No object embeddings could be loaded for the requested lineages.", call. = FALSE)
+  }
+
+  embedding_cols <- grep("^embedding_[0-9]{3}$", names(object_tbl), value = TRUE)
+  if (!length(embedding_cols)) {
+    stop("No embedding columns were found after loading the object tables.", call. = FALSE)
+  }
+
+  image_cell_summary <- object_tbl %>%
+    count(lineage_id, image_id, filename, passage_id, passage_number, name = "cell_count") %>%
+    arrange(lineage_id, passage_number, filename)
+
+  lineage_load_summary <- image_cell_summary %>%
+    group_by(lineage_id) %>%
+    summarise(
+      n_images = n(),
+      median_cells_per_image = median(cell_count),
+      min_cells_per_image = min(cell_count),
+      max_cells_per_image = max(cell_count),
+      n_cells = sum(cell_count),
+      .groups = "drop"
+    )
+
+  safe_saveRDS(
+    list(
+      object_tbl = object_tbl,
+      embedding_cols = embedding_cols,
+      image_cell_summary = image_cell_summary,
+      lineage_load_summary = lineage_load_summary
+    ),
+    embedding_load_cache
+  )
+}
+
+knitr::kable(lineage_load_summary, digits = 1)
+```
+
+## Filter Images By Cell Count
+
+```{r filter-images}
+filter_cache <- cache_path("filter_cache.rds")
+filter_cache_obj <- NULL
+
+if (file.exists(filter_cache) && !isTRUE(params$refresh_cache)) {
+  filter_cache_obj <- safe_readRDS(filter_cache)
+}
+
+if (!is.null(filter_cache_obj) && !isTRUE(params$refresh_cache)) {
+  eligible_images <- filter_cache_obj$eligible_images
+  filtered_object_tbl <- filter_cache_obj$filtered_object_tbl
+  filter_summary_tbl <- filter_cache_obj$filter_summary_tbl
+} else {
+  eligible_images <- image_cell_summary %>%
+    filter(
+      cell_count >= params$cell_count_min,
+      cell_count <= params$cell_count_max
+    )
+
+  filtered_object_tbl <- object_tbl %>%
+    inner_join(
+      eligible_images %>%
+        select(lineage_id, image_id),
+      by = c("lineage_id", "image_id")
+    )
+
+  filter_summary_tbl <- eligible_images %>%
+    group_by(lineage_id) %>%
+    summarise(
+      n_images_retained = n(),
+      n_cells_retained = sum(cell_count),
+      median_cells_per_image = median(cell_count),
+      .groups = "drop"
+    ) %>%
+    full_join(
+      image_cell_summary %>%
+        group_by(lineage_id) %>%
+        summarise(
+          n_images_total = n(),
+          n_cells_total = sum(cell_count),
+          .groups = "drop"
+        ),
+      by = "lineage_id"
+    ) %>%
+    mutate(
+      image_retention = percent(n_images_retained / n_images_total, accuracy = 0.1),
+      cell_retention = percent(n_cells_retained / n_cells_total, accuracy = 0.1)
+    ) %>%
+    arrange(lineage_id)
+
+  safe_saveRDS(
+    list(
+      eligible_images = eligible_images,
+      filtered_object_tbl = filtered_object_tbl,
+      filter_summary_tbl = filter_summary_tbl
+    ),
+    filter_cache
+  )
+}
+
+knitr::kable(filter_summary_tbl, digits = 1)
+```
+
+```{r filter-cell-count-plot}
+ggplot(image_cell_summary, aes(x = cell_count, fill = lineage_id)) +
+  geom_histogram(bins = 40, alpha = 0.65, position = "identity") +
+  geom_vline(
+    xintercept = c(params$cell_count_min, params$cell_count_max),
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  facet_wrap(~ lineage_id, scales = "free_y") +
+  labs(
+    title = "Per-image cell counts with retained range",
+    x = "Cells per image",
+    y = "Images",
+    fill = "Lineage"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+## Run Pooled PCA
+
+```{r pooled-pca}
+pca_cache <- cache_path("pca_cache.rds")
+pca_cache_obj <- NULL
+
+if (file.exists(pca_cache) && !isTRUE(params$refresh_cache)) {
+  pca_cache_obj <- safe_readRDS(pca_cache)
+}
+
+if (!is.null(pca_cache_obj) && !isTRUE(params$refresh_cache)) {
+  pca_model <- pca_cache_obj$pca_model
+  pca_tbl <- pca_cache_obj$pca_tbl
+  pca_variance_tbl <- pca_cache_obj$pca_variance_tbl
+  pc_cols <- pca_cache_obj$pc_cols
+} else {
+  feature_mat <- filtered_object_tbl %>%
+    select(all_of(embedding_cols)) %>%
+    as.matrix()
+
+  keep_rows <- stats::complete.cases(feature_mat)
+  feature_mat <- feature_mat[keep_rows, , drop = FALSE]
+  pca_input_tbl <- filtered_object_tbl[keep_rows, , drop = FALSE]
+
+  if (!nrow(feature_mat)) {
+    stop("No complete embedding rows remained after filtering.", call. = FALSE)
+  }
+
+  scaled_mat <- scale(feature_mat)
+  pca_model <- prcomp(scaled_mat, center = FALSE, scale. = FALSE)
+  n_pcs <- min(params$n_pcs, ncol(pca_model$x))
+  pc_cols <- sprintf("PC%02d", seq_len(n_pcs))
+
+  pca_tbl <- pca_input_tbl %>%
+    bind_cols(
+      as_tibble(pca_model$x[, seq_len(n_pcs), drop = FALSE], .name_repair = "minimal") %>%
+        stats::setNames(pc_cols)
+    )
+
+  pca_variance_tbl <- tibble(
+    pc = factor(pc_cols, levels = pc_cols),
+    variance_explained = (pca_model$sdev[seq_len(n_pcs)] ^ 2) / sum(pca_model$sdev ^ 2),
+    cumulative_variance = cumsum((pca_model$sdev[seq_len(n_pcs)] ^ 2) / sum(pca_model$sdev ^ 2))
+  )
+
+  safe_saveRDS(
+    list(
+      pca_model = pca_model,
+      pca_tbl = pca_tbl,
+      pca_variance_tbl = pca_variance_tbl,
+      pc_cols = pc_cols
+    ),
+    pca_cache
+  )
+}
+
+tibble(
+  retained_images = nrow(eligible_images),
+  retained_cells = nrow(filtered_object_tbl),
+  complete_cells_for_pca = nrow(pca_tbl),
+  embedding_dims = length(embedding_cols),
+  n_pcs = length(pc_cols),
+  pca_cache = pca_cache
+) %>%
+  knitr::kable()
+```
+
+```{r pca-variance-plot}
+ggplot(pca_variance_tbl, aes(x = pc, y = variance_explained)) +
+  geom_col(fill = "#2C7FB8") +
+  geom_line(aes(y = cumulative_variance, group = 1), color = "#D95F0E", linewidth = 0.8) +
+  geom_point(aes(y = cumulative_variance), color = "#D95F0E", size = 1.2) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Pooled PCA variance explained",
+    x = NULL,
+    y = "Variance explained"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Downsample For UMAP
+
+```{r umap-input}
+umap_cache <- cache_path("umap_cache.rds")
+umap_cache_obj <- NULL
+
+if (file.exists(umap_cache) && !isTRUE(params$refresh_cache)) {
+  umap_cache_obj <- safe_readRDS(umap_cache)
+}
+
+if (!is.null(umap_cache_obj) && !isTRUE(params$refresh_cache)) {
+  umap_tbl <- umap_cache_obj$umap_tbl
+  n_neighbors <- umap_cache_obj$n_neighbors
+  umap_source_tbl <- umap_cache_obj$umap_source_tbl
+} else {
+  umap_source_tbl <- balanced_sample_by_lineage(
+    pca_tbl,
+    lineage_col = "lineage_id",
+    max_n = params$max_umap_cells,
+    seed = params$seed
+  )
+
+  n_neighbors <- min(params$umap_neighbors, max(2, nrow(umap_source_tbl) - 1))
+  if (nrow(umap_source_tbl) < 3) {
+    stop("UMAP requires at least 3 cells after filtering/downsampling.", call. = FALSE)
+  }
+
+  set.seed(params$seed)
+  umap_coords <- uwot::umap(
+    umap_source_tbl %>% select(all_of(pc_cols)) %>% as.matrix(),
+    n_neighbors = n_neighbors,
+    min_dist = params$umap_min_dist,
+    metric = "euclidean",
+    verbose = FALSE,
+    ret_model = FALSE
+  )
+
+  umap_tbl <- umap_source_tbl %>%
+    mutate(
+      UMAP1 = umap_coords[, 1],
+      UMAP2 = umap_coords[, 2]
+    )
+
+  safe_saveRDS(
+    list(
+      umap_tbl = umap_tbl,
+      umap_source_tbl = umap_source_tbl,
+      n_neighbors = n_neighbors
+    ),
+    umap_cache
+  )
+}
+
+tibble(
+  cells_entering_umap = nrow(umap_tbl),
+  downsampled = nrow(pca_tbl) > nrow(umap_tbl),
+  umap_neighbors = n_neighbors,
+  umap_min_dist = params$umap_min_dist,
+  umap_cache = umap_cache
+) %>%
+  knitr::kable()
+```
+
+```{r umap-balance-summary}
+umap_tbl %>%
+  count(lineage_id, name = "n_umap_cells") %>%
+  left_join(pca_tbl %>% count(lineage_id, name = "n_pca_cells"), by = "lineage_id") %>%
+  mutate(sample_fraction = n_umap_cells / n_pca_cells) %>%
+  arrange(lineage_id) %>%
+  knitr::kable(digits = 3)
+```
+
+## UMAP Summary
+
+```{r umap-summary-plot}
+umap_summary_tbl <- umap_tbl %>%
+  group_by(lineage_id, passage_number) %>%
+  summarise(
+    n_cells = n(),
+    mean_log1p_area = mean(log1p_area, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(umap_summary_tbl, aes(x = passage_number, y = lineage_id)) +
+  geom_point(aes(size = n_cells, color = mean_log1p_area), alpha = 0.9) +
+  scale_size_area(max_size = 10) +
+  scale_color_viridis_c(option = "C") +
+  labs(
+    title = "UMAP sample composition by lineage and passage",
+    x = "Passage number",
+    y = "Lineage",
+    size = "UMAP cells",
+    color = "Mean log1p area"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+## Lineage-Separating PCs
+
+```{r separating-pcs}
+pc_separation_tbl <- compute_lineage_pc_separation(
+  pca_tbl,
+  pc_cols = pc_cols,
+  control_lineage_id = params$control_lineage_id
+)
+
+top_sep_pcs <- head(pc_separation_tbl$pc, min(4, nrow(pc_separation_tbl)))
+top_sep_pc_pair <- head(pc_separation_tbl$pc, min(2, nrow(pc_separation_tbl)))
+
+pc_separation_tbl %>%
+  slice_head(n = 10) %>%
+  knitr::kable(digits = 3)
+```
+
+```{r separating-pcs-bar}
+ggplot(pc_separation_tbl %>% slice_head(n = 10), aes(x = reorder(pc, cohens_d), y = cohens_d)) +
+  geom_col(fill = "#C44E52") +
+  coord_flip() +
+  labs(
+    title = sprintf("Top PCs separating treated lineages from control (%s)", params$control_lineage_id),
+    x = NULL,
+    y = "Absolute Cohen's d"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+```{r separating-pcs-density}
+pca_tbl %>%
+  select(lineage_id, all_of(top_sep_pcs)) %>%
+  pivot_longer(cols = all_of(top_sep_pcs), names_to = "pc", values_to = "score") %>%
+  mutate(
+    lineage_group = if_else(lineage_id == params$control_lineage_id, "control", "treated")
+  ) %>%
+  ggplot(aes(x = score, color = lineage_group, fill = lineage_group)) +
+  geom_density(alpha = 0.18, linewidth = 0.8) +
+  facet_wrap(~ pc, scales = "free", ncol = 2) +
+  labs(
+    title = "Top separating PCs: treated vs control density",
+    x = "PC score",
+    y = "Density",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_bw(base_size = 11)
+```
+
+```{r separating-pcs-by-lineage}
+pca_tbl %>%
+  select(lineage_id, all_of(top_sep_pcs)) %>%
+  pivot_longer(cols = all_of(top_sep_pcs), names_to = "pc", values_to = "score") %>%
+  mutate(lineage_id = factor(lineage_id, levels = lineage_ids)) %>%
+  ggplot(aes(x = score, color = lineage_id, fill = lineage_id)) +
+  geom_density(alpha = 0.14, linewidth = 0.8) +
+  facet_wrap(~ pc, scales = "free", ncol = 2) +
+  labs(
+    title = "Top separating PCs by lineage",
+    x = "PC score",
+    y = "Density",
+    color = "Lineage",
+    fill = "Lineage"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+```{r separating-pcs-2d-density}
+if (length(top_sep_pc_pair) >= 2) {
+  plot_density_contours(
+    pca_tbl %>% mutate(lineage_id = factor(lineage_id, levels = lineage_ids)),
+    x_col = top_sep_pc_pair[[1]],
+    y_col = top_sep_pc_pair[[2]],
+    title = sprintf("2D density for top discriminative PCs: %s vs %s", top_sep_pc_pair[[1]], top_sep_pc_pair[[2]]),
+    facet_col = "lineage_id",
+    bins = 9
+  )
+}
+```
+
+```{r separating-pcs-2d-diff}
+if (length(top_sep_pc_pair) >= 2) {
+  plot_density_difference(
+    pca_tbl %>% mutate(lineage_group = if_else(lineage_id == params$control_lineage_id, "control", "treated")),
+    x_col = top_sep_pc_pair[[1]],
+    y_col = top_sep_pc_pair[[2]],
+    group_col = "lineage_group",
+    group_a = "treated",
+    group_b = "control",
+    title = sprintf("Differential density for top discriminative PCs: %s vs %s", top_sep_pc_pair[[1]], top_sep_pc_pair[[2]]),
+    bins = 70
+  )
+}
+```
+
+```{r separating-pcs-passage-quantiles}
+pca_tbl %>%
+  select(lineage_id, passage_number, all_of(top_sep_pcs)) %>%
+  pivot_longer(cols = all_of(top_sep_pcs), names_to = "pc", values_to = "score") %>%
+  group_by(lineage_id, passage_number, pc) %>%
+  summarise(
+    q10 = quantile(score, probs = 0.10, na.rm = TRUE),
+    q50 = quantile(score, probs = 0.50, na.rm = TRUE),
+    q90 = quantile(score, probs = 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(lineage_id = factor(lineage_id, levels = lineage_ids)) %>%
+  ggplot(aes(x = passage_number, group = lineage_id)) +
+  geom_ribbon(aes(ymin = q10, ymax = q90, fill = lineage_id), alpha = 0.18, color = NA) +
+  geom_line(aes(y = q50, color = lineage_id), linewidth = 0.9) +
+  geom_point(aes(y = q50, color = lineage_id), size = 1.3) +
+  facet_wrap(~ pc, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Top separating PCs across passage",
+    x = "Passage number",
+    y = "PC score quantiles",
+    color = "Lineage",
+    fill = "Lineage"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+```{r separating-pcs-passage-treated-vs-control}
+pca_tbl %>%
+  mutate(lineage_group = if_else(lineage_id == params$control_lineage_id, "control", "treated")) %>%
+  select(lineage_group, passage_number, all_of(top_sep_pcs)) %>%
+  pivot_longer(cols = all_of(top_sep_pcs), names_to = "pc", values_to = "score") %>%
+  group_by(lineage_group, passage_number, pc) %>%
+  summarise(
+    q10 = quantile(score, probs = 0.10, na.rm = TRUE),
+    q50 = quantile(score, probs = 0.50, na.rm = TRUE),
+    q90 = quantile(score, probs = 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = passage_number, group = lineage_group)) +
+  geom_ribbon(aes(ymin = q10, ymax = q90, fill = lineage_group), alpha = 0.18, color = NA) +
+  geom_line(aes(y = q50, color = lineage_group), linewidth = 0.9) +
+  geom_point(aes(y = q50, color = lineage_group), size = 1.3) +
+  facet_wrap(~ pc, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Top separating PCs across passage: treated vs control",
+    x = "Passage number",
+    y = "PC score quantiles",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_bw(base_size = 11)
+```
+
+## Alternative Views
+
+For these dense pooled embeddings, occupancy and density views are easier to read than raw points. The plots below summarize local cell concentration and explicitly compare treated versus control density.
+
+```{r umap-lineage-heatmap}
+plot_binned_embedding(
+  umap_tbl %>% mutate(lineage_id = factor(lineage_id, levels = lineage_ids)),
+  x_col = "UMAP1",
+  y_col = "UMAP2",
+  title = "UMAP occupancy heatmap by lineage",
+  facet_col = "lineage_id",
+  bins = 50
+)
+```
+
+```{r umap-lineage-contours}
+plot_density_contours(
+  umap_tbl %>% mutate(lineage_id = factor(lineage_id, levels = lineage_ids)),
+  x_col = "UMAP1",
+  y_col = "UMAP2",
+  title = "UMAP density contours by lineage",
+  facet_col = "lineage_id",
+  bins = 9
+)
+```
+
+```{r umap-treated-vs-control-diff}
+plot_density_difference(
+  umap_tbl %>% mutate(lineage_group = if_else(lineage_id == params$control_lineage_id, "control", "treated")),
+  x_col = "UMAP1",
+  y_col = "UMAP2",
+  group_col = "lineage_group",
+  group_a = "treated",
+  group_b = "control",
+  title = "UMAP differential density: treated minus control",
+  bins = 70
+)
+```
+
+```{r discriminative-pc-heatmap}
+if (length(top_sep_pc_pair) >= 2) {
+  plot_binned_embedding(
+    pca_tbl %>% mutate(lineage_id = factor(lineage_id, levels = lineage_ids)),
+    x_col = top_sep_pc_pair[[1]],
+    y_col = top_sep_pc_pair[[2]],
+    title = sprintf("Occupancy heatmap for top discriminative PCs: %s vs %s", top_sep_pc_pair[[1]], top_sep_pc_pair[[2]]),
+    facet_col = "lineage_id",
+    bins = 50
+  )
+}
+```

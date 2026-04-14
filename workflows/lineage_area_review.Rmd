@@ -1,50 +1,46 @@
 ---
-title: "Lineage Area Review"
+title: "Filtered Lineage Area Distributions"
 output:
   html_document:
     toc: true
     toc_float: true
 params:
-  lineage_id: null
-  analysis_dir: null
   all_results_dir: "data/lineage_area"
-  manifest_csv: "manifests/image_manifest.csv"
-  show_images: true
-  max_images: 10
+  filtered_image_csv: "data/lineage_area/filtered_trajectory_images.csv"
+  image_subset_mode: "filtered_progression"
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
-  echo = TRUE,
+  echo = FALSE,
   warning = FALSE,
   message = FALSE,
-  fig.width = 9,
-  fig.height = 5.5
+  fig.width = 10,
+  fig.height = 5.8
 )
 ```
 
 ## Overview
 
-This notebook reviews the saved area analyses across all lineages and highlights the most promising long-term distribution changes.
+This notebook shows object-area distributions along passage trajectories for a configurable image subset.
 
-The intended use is:
+The active subset mode is `r params$image_subset_mode`.
 
-1. Rank lineages by how strongly their adjusted area distributions change across passages.
-2. Pick one promising lineage and transition.
-3. Inspect the raw image panel around that transition to check whether the statistical signal looks real.
+- `filtered_progression`: images from the streamlined trajectory filter
+- `day0_only`: only images with `time_since_seeding_days == 0`
 
-## Packages
+When `filtered_progression` is active, the filtered image list is read from `r params$filtered_image_csv`, so this notebook stays aligned with the trajectory notebook rather than reimplementing the filter.
 
-```{r packages}
+```{r packages, include=FALSE}
 required_packages <- c(
   "dplyr",
   "ggplot2",
   "purrr",
   "readr",
-  "tibble",
-  "tidyr",
+  "scales",
   "stringr",
-  "scales"
+  "tibble",
+  "tidyr"
 )
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
@@ -62,15 +58,13 @@ library(dplyr)
 library(ggplot2)
 library(purrr)
 library(readr)
+library(scales)
+library(stringr)
 library(tibble)
 library(tidyr)
-library(stringr)
-library(scales)
 ```
 
-## Helpers
-
-```{r helpers}
+```{r helpers, include=FALSE}
 resolve_project_root <- function() {
   candidates <- c(
     normalizePath(".", winslash = "/", mustWork = FALSE),
@@ -97,27 +91,49 @@ project_path <- function(path) {
   out
 }
 
-analysis_dir_from_id <- function(lineage_id) {
-  file.path(project_path(params$all_results_dir), paste0("lineage_", lineage_id))
+read_analysis_bundle <- function(path) {
+  obj <- readRDS(path)
+  list(
+    lineage_id = as.character(obj$lineage_id),
+    cells = tibble::as_tibble(obj$cells)
+  )
 }
 
-parse_datetime_safe <- function(x) {
-  if (inherits(x, "POSIXct")) return(x)
-  x <- as.character(x)
-  out <- as.POSIXct(rep(NA_character_, length(x)), tz = "UTC")
-  formats <- c(
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%dT%H:%M:%SZ",
-    "%Y-%m-%d %H:%M:%OS",
-    "%m/%d/%Y %H:%M",
-    "%m/%d/%Y %H:%M:%S"
-  )
-  for (fmt in formats) {
-    missing <- is.na(out) & !is.na(x) & nzchar(x)
-    if (!any(missing)) next
-    out[missing] <- as.POSIXct(x[missing], format = fmt, tz = "UTC")
+load_png_cache_index <- function(manifest_csv = "manifests/image_manifest.csv", area_dir = "data/lineage_area", out_root = "data/lineage_png") {
+  manifest_tbl <- readr::read_csv(project_path(manifest_csv), show_col_types = FALSE) %>%
+    filter(artifact_type == "raw_image") %>%
+    distinct(filename, filepath, .keep_all = TRUE)
+
+  image_summary_files <- list.files(project_path(area_dir), pattern = "image_summary\\.csv$", recursive = TRUE, full.names = TRUE)
+
+  if (!length(image_summary_files)) {
+    return(tibble(
+      filename = character(),
+      raw_filepath = character(),
+      png_relpath = character(),
+      png_abspath = character(),
+      png_exists = logical(),
+      cache_lineage_id = character()
+    ))
   }
-  out
+
+  purrr::map_dfr(image_summary_files, function(path) {
+    lineage_dir <- basename(dirname(path))
+
+    readr::read_csv(path, show_col_types = FALSE) %>%
+      distinct(filename, .keep_all = TRUE) %>%
+      transmute(
+        filename,
+        cache_lineage_id = sub("^lineage_", "", lineage_dir)
+      ) %>%
+      left_join(manifest_tbl %>% transmute(filename, raw_filepath = filepath), by = "filename") %>%
+      mutate(
+        png_relpath = file.path(out_root, lineage_dir, sub("\\.[^.]+$", ".png", basename(filename))),
+        png_abspath = project_path(png_relpath),
+        png_exists = file.exists(png_abspath)
+      )
+  }) %>%
+    distinct(filename, .keep_all = TRUE)
 }
 
 safe_quantile <- function(x, prob) {
@@ -125,711 +141,572 @@ safe_quantile <- function(x, prob) {
   as.numeric(stats::quantile(x, probs = prob, na.rm = TRUE, names = FALSE))
 }
 
-rescale_01 <- function(x) {
-  rng <- range(x, na.rm = TRUE)
-  if (!all(is.finite(rng)) || diff(rng) <= 0) return(rep(0, length(x)))
-  (x - rng[[1]]) / diff(rng)
-}
+build_density_grid <- function(df, n_grid = 160) {
+  df <- df %>%
+    filter(is.finite(log10_area), is.finite(passage_position))
 
-normalize_for_display <- function(img) {
-  img <- as.array(img)
-  if (length(dim(img)) == 3) {
-    img <- apply(img[, , seq_len(min(3, dim(img)[3])), drop = FALSE], c(1, 2), mean)
+  if (!nrow(df)) {
+    return(tibble())
   }
-  q <- stats::quantile(img, probs = c(0.01, 0.99), na.rm = TRUE, names = FALSE)
-  img <- pmin(pmax(img, q[[1]]), q[[2]])
-  img <- img - min(img, na.rm = TRUE)
-  mx <- max(img, na.rm = TRUE)
-  if (is.finite(mx) && mx > 0) {
-    img <- img / mx
-  }
-  img
+
+  x_grid <- seq(min(df$log10_area), max(df$log10_area), length.out = n_grid)
+
+  df %>%
+    group_by(lineage_id, passage_position) %>%
+    group_modify(~ {
+      x <- .x$log10_area
+      if (length(x) < 2 || dplyr::n_distinct(x) < 2) {
+        tibble(log10_area = x_grid, density = 0)
+      } else {
+        dens <- stats::density(x, from = min(x_grid), to = max(x_grid), n = n_grid, na.rm = TRUE)
+        tibble(log10_area = dens$x, density = dens$y)
+      }
+    }) %>%
+    ungroup()
 }
 
-plot_grayscale_matrix <- function(img, main = "") {
-  raster_img <- as.raster(img[nrow(img):1, ], max = 1)
-  plot.new()
-  usr <- par("usr")
-  rasterImage(raster_img, usr[1], usr[3], usr[2], usr[4], interpolate = FALSE)
-  title(main = main, cex.main = 0.8)
-}
-
-get_lineage_pngs <- function(lineage_id, bundle, manifest_tbl, out_root = "data/lineage_png") {
-  out_dir <- file.path(project_path(out_root), paste0("lineage_", lineage_id))
-
-  png_tbl <- bundle$image_summary %>%
-    distinct(filename, .keep_all = TRUE) %>%
-    left_join(manifest_tbl %>% select(filename, filepath), by = "filename") %>%
-    filter(!is.na(filepath)) %>%
-    mutate(
-      raw_path = project_path(filepath),
-      png_path = file.path(out_dir, sub("\\.[^.]+$", ".png", basename(filename)))
-    )
-  png_tbl$png_exists <- file.exists(png_tbl$png_path)
-  png_tbl
-}
-
-read_analysis_bundle <- function(path) {
-  obj <- readRDS(path)
-  list(
-    lineage_id = as.character(obj$lineage_id),
-    cells = tibble::as_tibble(obj$cells),
-    image_summary = tibble::as_tibble(obj$image_summary),
-    passage_summary = tibble::as_tibble(obj$passage_summary)
+trajectory_crop_card <- function(img_src, title_text, subtitle_text, crop_scale = sqrt(10)) {
+  sprintf(
+    paste0(
+      "<div style=\"width:300px;\">",
+      "<div style=\"width:300px;height:224px;overflow:hidden;border:1px solid #d0d0d0;background:#fafafa;\">",
+      "<img src=\"%s\" style=\"width:100%%;height:100%%;object-fit:cover;transform:scale(%.4f);transform-origin:center center;display:block;\" />",
+      "</div>",
+      "<div style=\"font-size:13px;line-height:1.3;margin-top:6px;\">",
+      "<div><strong>%s</strong></div>",
+      "<div>%s</div>",
+      "</div></div>"
+    ),
+    img_src,
+    crop_scale,
+    title_text,
+    subtitle_text
   )
 }
 
-smooth_series <- function(x) {
-  x <- as.numeric(x)
-  n <- length(x)
-  if (n <= 2) return(x)
-  k <- min(5, if (n %% 2 == 1) n else n - 1)
-  if (k < 3) k <- 3
-  k <- min(k, if (n %% 2 == 1) n else n - 1)
-  if (k < 3) return(x)
-  stats::runmed(x, k = k, endrule = "median")
+residualize_by_passage <- function(df, value_col) {
+  value_sym <- rlang::ensym(value_col)
+
+  df %>%
+    group_by(lineage_id) %>%
+    group_modify(~ {
+      dat <- .x
+      y <- dplyr::pull(dat, !!value_sym)
+      ok <- is.finite(y) & is.finite(dat$passage_position)
+
+      resid_vec <- rep(NA_real_, nrow(dat))
+      if (sum(ok) >= 3) {
+        unique_passages <- dplyr::n_distinct(dat$passage_position[ok])
+        if (unique_passages >= 4) {
+          fit <- stats::lm(y ~ splines::ns(dat$passage_position, df = min(3, unique_passages - 1)), subset = ok)
+        } else if (unique_passages >= 2) {
+          fit <- stats::lm(y ~ dat$passage_position, subset = ok)
+        } else {
+          fit <- stats::lm(y ~ 1, subset = ok)
+        }
+        resid_vec[ok] <- stats::resid(fit)
+      }
+
+      dat$residual <- resid_vec
+      dat
+    }) %>%
+    ungroup() %>%
+    rename(!!paste0(rlang::as_string(value_sym), "_resid") := residual)
 }
 
-calc_monotonicity <- function(x) {
-  net <- abs(x[[length(x)]] - x[[1]])
-  total <- sum(abs(diff(x)))
-  if (!is.finite(total) || total <= 0) return(0)
-  net / total
-}
+adjust_for_confluence <- function(df, value_col = log10_area, covariate_col = confluence) {
+  value_sym <- rlang::ensym(value_col)
+  covariate_sym <- rlang::ensym(covariate_col)
 
-lineage_trend_summary <- function(df) {
-  df <- df %>% arrange(passage_position)
-  n_passages <- nrow(df)
-  start_passage_id <- df$passage_id[[1]]
-  end_passage_id <- df$passage_id[[n_passages]]
-  matched_passage_fraction <- if ("n_matched_images" %in% names(df)) {
-    mean(df$n_matched_images > 0, na.rm = TRUE)
-  } else {
-    NA_real_
-  }
+  df %>%
+    group_by(lineage_id) %>%
+    group_modify(~ {
+      dat <- .x
+      y <- dplyr::pull(dat, !!value_sym)
+      x <- dplyr::pull(dat, !!covariate_sym)
+      ok <- is.finite(y) & is.finite(x)
 
-  score_df <- df %>%
-    filter(
-      is.finite(median_z) |
-      is.finite(iqr_z) |
-      is.finite(q99_z) |
-      is.finite(frac_z_gt_3)
-    ) %>%
-    arrange(passage_position)
+      adjusted <- rep(NA_real_, nrow(dat))
+      if (sum(ok) >= 10) {
+        unique_x <- dplyr::n_distinct(round(x[ok], 4))
+        if (unique_x >= 4) {
+          fit <- stats::lm(y ~ splines::ns(x, df = min(3, unique_x - 1)), subset = ok)
+        } else if (unique_x >= 2) {
+          fit <- stats::lm(y ~ x, subset = ok)
+        } else {
+          fit <- stats::lm(y ~ 1, subset = ok)
+        }
 
-  if (nrow(score_df) < 3) {
-    return(tibble(
-      n_passages = n_passages,
-      n_scored_passages = nrow(score_df),
-      matched_passage_fraction = matched_passage_fraction,
-      start_passage_id = start_passage_id,
-      end_passage_id = end_passage_id,
-      smooth_delta_median_z = NA_real_,
-      smooth_delta_iqr_z = NA_real_,
-      smooth_delta_q99_z = NA_real_,
-      smooth_delta_frac_z_gt_3 = NA_real_,
-      max_adjacent_jump_q99_z = NA_real_,
-      max_adjacent_jump_frac_z_gt_3 = NA_real_,
-      monotonicity_median = NA_real_,
-      monotonicity_q99 = NA_real_,
-      monotonicity_frac_z_gt_3 = NA_real_,
-      long_term_score = NA_real_,
-      trend_class = "Insufficient data",
-      trend_direction = "undetermined",
-      trend_statement = "Fewer than three passages had enough analyzed objects to assess a longitudinal trend."
-    ))
-  }
+        pred <- rep(NA_real_, nrow(dat))
+        pred[ok] <- stats::predict(fit, newdata = data.frame(x = x[ok]))
+        adjusted[ok] <- y[ok] - pred[ok] + stats::median(y[ok], na.rm = TRUE)
+      }
 
-  med_s <- smooth_series(score_df$median_z)
-  iqr_s <- smooth_series(score_df$iqr_z)
-  q99_s <- smooth_series(score_df$q99_z)
-  frac_s <- smooth_series(score_df$frac_z_gt_3)
-
-  delta_med <- med_s[[length(med_s)]] - med_s[[1]]
-  delta_iqr <- iqr_s[[length(iqr_s)]] - iqr_s[[1]]
-  delta_q99 <- q99_s[[length(q99_s)]] - q99_s[[1]]
-  delta_frac <- frac_s[[length(frac_s)]] - frac_s[[1]]
-
-  monotonicity_median <- calc_monotonicity(med_s)
-  monotonicity_q99 <- calc_monotonicity(q99_s)
-  monotonicity_frac <- calc_monotonicity(frac_s)
-
-  long_term_score_raw <-
-    abs(delta_med) +
-    0.5 * abs(delta_iqr) +
-    1.5 * abs(delta_q99) +
-    8 * abs(delta_frac)
-
-  consistency_weight <- mean(c(monotonicity_median, monotonicity_q99, monotonicity_frac), na.rm = TRUE)
-  long_term_score <- long_term_score_raw * consistency_weight * log1p(n_passages)
-
-  primary_signal <- c(
-    center = abs(delta_med),
-    spread = 0.75 * abs(delta_iqr),
-    tail = max(abs(delta_q99), 4 * abs(delta_frac))
-  )
-  primary_axis <- names(primary_signal)[which.max(primary_signal)]
-  signed_tail <- delta_q99 + 4 * delta_frac
-  signed_center <- delta_med
-  signed_spread <- delta_iqr
-
-  if (!is.finite(long_term_score) || long_term_score < 0.75 || consistency_weight < 0.2) {
-    trend_class <- "No clear long-term trend"
-    trend_direction <- "none"
-    trend_statement <- "No strong, persistent long-term drift is evident once passage-level noise is accounted for."
-  } else if (primary_axis == "tail") {
-    trend_direction <- if (signed_tail >= 0) "larger-tail" else "smaller-tail"
-    trend_class <- if (signed_tail >= 0) "Upper-tail expansion" else "Upper-tail contraction"
-    trend_statement <- sprintf(
-      "%s: the upper tail changes more than the lineage center, suggesting a persistent %s of unusually large cells.",
-      trend_class,
-      if (signed_tail >= 0) "enrichment" else "loss"
-    )
-  } else if (primary_axis == "spread") {
-    trend_direction <- if (signed_spread >= 0) "broader" else "tighter"
-    trend_class <- if (signed_spread >= 0) "Distribution broadening" else "Distribution tightening"
-    trend_statement <- sprintf(
-      "%s: dispersion changes dominate over center shift, indicating the lineage is becoming %s over time.",
-      trend_class,
-      if (signed_spread >= 0) "more heterogeneous" else "more homogeneous"
-    )
-  } else {
-    trend_direction <- if (signed_center >= 0) "larger" else "smaller"
-    trend_class <- if (signed_center >= 0) "Bulk shift upward" else "Bulk shift downward"
-    trend_statement <- sprintf(
-      "%s: the lineage center drifts %s over time, consistent with a broad change in typical cell size rather than only a tail effect.",
-      trend_class,
-      if (signed_center >= 0) "toward larger residuals" else "toward smaller residuals"
-    )
-  }
-
-  tibble(
-    n_passages = n_passages,
-    n_scored_passages = nrow(score_df),
-    matched_passage_fraction = matched_passage_fraction,
-    start_passage_id = start_passage_id,
-    end_passage_id = end_passage_id,
-    smooth_delta_median_z = delta_med,
-    smooth_delta_iqr_z = delta_iqr,
-    smooth_delta_q99_z = delta_q99,
-    smooth_delta_frac_z_gt_3 = delta_frac,
-    max_adjacent_jump_q99_z = max(abs(diff(score_df$q99_z)), na.rm = TRUE),
-    max_adjacent_jump_frac_z_gt_3 = max(abs(diff(score_df$frac_z_gt_3)), na.rm = TRUE),
-    monotonicity_median = monotonicity_median,
-    monotonicity_q99 = monotonicity_q99,
-    monotonicity_frac_z_gt_3 = monotonicity_frac,
-    long_term_score = long_term_score,
-    trend_class = trend_class,
-    trend_direction = trend_direction,
-    trend_statement = trend_statement
-  )
-}
-
-choose_representative_passages <- function(df) {
-  score_df <- df %>%
-    filter(
-      is.finite(median_z) |
-      is.finite(iqr_z) |
-      is.finite(q99_z) |
-      is.finite(frac_z_gt_3)
-    ) %>%
-    arrange(passage_position)
-
-  if (!nrow(score_df)) {
-    return(character())
-  }
-
-  idx <- unique(c(1, ceiling(nrow(score_df) / 2), nrow(score_df)))
-  score_df$passage_id[idx]
-}
-
-build_lineage_timepoint_tbl <- function(bundle) {
-  flatten_scalar_chr <- function(x) {
-    if (!is.list(x)) return(as.character(x))
-    vapply(x, function(value) {
-      if (!length(value) || all(is.na(value))) return(NA_character_)
-      as.character(value[[1]])
-    }, character(1))
-  }
-
-  flatten_scalar_num <- function(x) {
-    if (!is.list(x)) return(as.numeric(x))
-    vapply(x, function(value) {
-      if (!length(value) || all(is.na(value))) return(NA_real_)
-      suppressWarnings(as.numeric(value[[1]]))
-    }, numeric(1))
-  }
-
-  bundle$cells %>%
-    transmute(
-      lineage_id = flatten_scalar_chr(lineage_id),
-      passage_id = flatten_scalar_chr(passage_id),
-      passage_position = suppressWarnings(as.integer(flatten_scalar_num(passage_position))),
-      image_id = flatten_scalar_chr(image_id),
-      image_time = parse_datetime_safe(flatten_scalar_chr(image_time)),
-      time_since_passage_start_days = flatten_scalar_num(time_since_passage_start_hours) / 24
-    ) %>%
-    dplyr::distinct(lineage_id, passage_id, passage_position, image_id, image_time, time_since_passage_start_days) %>%
-    dplyr::filter(is.finite(time_since_passage_start_days)) %>%
-    dplyr::count(lineage_id, passage_id, passage_position, time_since_passage_start_days, name = "n_images") %>%
-    dplyr::arrange(passage_position, time_since_passage_start_days)
+      dat$adjusted_value <- adjusted
+      dat
+    }) %>%
+    ungroup() %>%
+    rename(!!paste0(rlang::as_string(value_sym), "_adj_confluence") := adjusted_value)
 }
 ```
 
-## Discover Analysis Outputs
+```{r load-data, include=FALSE}
+filtered_image_path <- project_path(params$filtered_image_csv)
+png_cache_index <- load_png_cache_index(area_dir = params$all_results_dir)
 
-```{r discover-results}
-all_results_dir <- project_path(params$all_results_dir)
 analysis_paths <- list.files(
-  all_results_dir,
+  project_path(params$all_results_dir),
   pattern = "lineage_area_analysis\\.rds$",
   recursive = TRUE,
   full.names = TRUE
 )
 
 if (!length(analysis_paths)) {
-  stop(sprintf("No lineage analysis outputs found under %s", all_results_dir), call. = FALSE)
+  stop(sprintf("No lineage analysis outputs found under %s", project_path(params$all_results_dir)), call. = FALSE)
 }
 
-analysis_index <- tibble(
-  analysis_rds = analysis_paths,
-  analysis_dir = dirname(analysis_paths),
-  lineage_id = sub("^lineage_", "", basename(dirname(analysis_paths)))
-)
+summary_bundle <- purrr::map(analysis_paths, read_analysis_bundle)
 
-knitr::kable(
-  tibble(
-    n_lineages_found = nrow(analysis_index),
-    results_dir = all_results_dir
-  )
-)
-```
-
-## Load Summary Metrics Across All Lineages
-
-```{r load-all-summaries}
-summary_bundle <- purrr::map(analysis_index$analysis_rds, read_analysis_bundle)
-
-all_passage_tbl <- purrr::map2_dfr(summary_bundle, analysis_index$analysis_dir, function(bundle, analysis_dir) {
-  bundle$passage_summary %>%
+all_cells_tbl <- purrr::map_dfr(summary_bundle, function(bundle) {
+  bundle$cells %>%
     mutate(
-      lineage_id = bundle$lineage_id,
-      analysis_dir = analysis_dir,
-      passage_position = as.integer(passage_position),
-      first_image_time = parse_datetime_safe(first_image_time)
+      lineage_id = as.character(lineage_id),
+      passage_id = as.character(passage_id),
+      passage_position = suppressWarnings(as.integer(passage_position)),
+      filename = as.character(filename),
+      area_px = as.numeric(area_px),
+      log_area = as.numeric(log_area),
+      p_real = as.numeric(p_real)
     )
 })
 
-all_image_tbl <- purrr::map2_dfr(summary_bundle, analysis_index$analysis_dir, function(bundle, analysis_dir) {
-  bundle$image_summary %>%
-    mutate(
-      lineage_id = bundle$lineage_id,
-      analysis_dir = analysis_dir,
-      passage_position = as.integer(passage_position)
+all_image_meta_tbl <- all_cells_tbl %>%
+  transmute(
+    lineage_id,
+    passage_id,
+    passage_position,
+    filename,
+    time_since_seeding_days = as.numeric(time_since_passage_start_hours) / 24,
+    confluence = as.numeric(confluence_um2),
+    cell_count = as.numeric(cell_count)
+  ) %>%
+  distinct(lineage_id, passage_id, passage_position, filename, .keep_all = TRUE)
+
+filtered_image_tbl <- NULL
+if (identical(params$image_subset_mode, "filtered_progression")) {
+  if (!file.exists(filtered_image_path)) {
+    stop(
+      sprintf(
+        "Filtered image CSV not found: %s. Render workflows/trajectory_alignment_exemplar_lineages_streamlined.Rmd first.",
+        filtered_image_path
+      ),
+      call. = FALSE
     )
-})
+  }
 
-image_passage_tbl <- all_image_tbl %>%
-  group_by(lineage_id, passage_id, passage_position) %>%
-  summarise(
-    mean_objects_per_image = mean(n_objects, na.rm = TRUE),
-    median_objects_per_image = median(n_objects, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-all_passage_tbl <- all_passage_tbl %>%
-  left_join(image_passage_tbl, by = c("lineage_id", "passage_id", "passage_position"))
-
-all_timepoint_tbl <- purrr::map_dfr(summary_bundle, build_lineage_timepoint_tbl)
-```
-
-## Raw Image PNG Availability
-
-```{r detect-lineage-pngs}
-manifest_path <- project_path(params$manifest_csv)
-manifest_tbl <- readr::read_csv(manifest_path, show_col_types = FALSE) %>%
-  filter(artifact_type == "raw_image") %>%
-  distinct(filename, filepath, .keep_all = TRUE)
-
-png_index <- purrr::map2(summary_bundle, analysis_index$lineage_id, function(bundle, lineage_id) {
-  get_lineage_pngs(lineage_id, bundle, manifest_tbl)
-})
-names(png_index) <- analysis_index$lineage_id
-
-missing_png_tbl <- purrr::imap_dfr(png_index, function(tbl, lineage_id) {
-  tibble(
-    lineage_id = lineage_id,
-    n_raw_images = nrow(tbl),
-    n_png_found = sum(tbl$png_exists, na.rm = TRUE)
-  )
-})
-
-knitr::kable(missing_png_tbl)
-
-if (any(missing_png_tbl$n_png_found < missing_png_tbl$n_raw_images)) {
-  warning(
-    paste(
-      "Some lineage PNGs are missing.",
-      "Run `sbatch scripts/submit_lineage_png_cache.slurm data/lineage_area manifests/image_manifest.csv data/lineage_png`",
-      "to generate them before rendering any image panels."
+  filtered_image_tbl <- readr::read_csv(filtered_image_path, show_col_types = FALSE) %>%
+    transmute(
+      lineage_id = as.character(lineage_id),
+      passage_id = as.character(passage_id),
+      passage_position = suppressWarnings(as.integer(passage_position)),
+      filename = as.character(filename),
+      time_since_seeding_days = as.numeric(time_since_seeding_days),
+      confluence = as.numeric(confluence),
+      cell_count = as.numeric(cell_count)
+    ) %>%
+    distinct(lineage_id, passage_id, passage_position, filename, .keep_all = TRUE)
+} else if (identical(params$image_subset_mode, "day0_only")) {
+  filtered_image_tbl <- all_image_meta_tbl %>%
+    filter(is.finite(time_since_seeding_days), abs(time_since_seeding_days) < 1e-8)
+} else {
+  stop(
+    sprintf(
+      "Unknown image_subset_mode: %s. Supported modes are filtered_progression and day0_only.",
+      params$image_subset_mode
     ),
     call. = FALSE
   )
 }
-```
 
-## Per-Lineage Trend Summary
+if (!nrow(filtered_image_tbl)) {
+  stop(sprintf("No images matched subset mode %s.", params$image_subset_mode), call. = FALSE)
+}
 
-```{r lineage-summary}
-lineage_rank_tbl <- all_passage_tbl %>%
-  arrange(lineage_id, passage_position) %>%
-  group_by(lineage_id) %>%
-  group_modify(~ lineage_trend_summary(.x)) %>%
-  ungroup()
+subset_label <- dplyr::case_when(
+  identical(params$image_subset_mode, "filtered_progression") ~ "Streamlined progression filter",
+  identical(params$image_subset_mode, "day0_only") ~ "Day-0 images only",
+  TRUE ~ params$image_subset_mode
+)
 
-top_lineage_tbl <- lineage_rank_tbl %>%
-  select(
-    lineage_id,
-    n_passages,
-    n_scored_passages,
-    matched_passage_fraction,
-    start_passage_id,
-    end_passage_id,
-    trend_class,
-    long_term_score,
-    smooth_delta_median_z,
-    smooth_delta_iqr_z,
-    smooth_delta_q99_z,
-    smooth_delta_frac_z_gt_3,
-    monotonicity_median,
-    monotonicity_q99,
-    monotonicity_frac_z_gt_3
+filtered_cells_tbl <- all_cells_tbl %>%
+  inner_join(
+    filtered_image_tbl,
+    by = c("lineage_id", "passage_id", "passage_position", "filename")
+  ) %>%
+  filter(is.finite(area_px), area_px > 0) %>%
+  mutate(
+    log10_area = log10(area_px),
+    passage_f = factor(passage_position, levels = sort(unique(passage_position)))
   )
 
-knitr::kable(top_lineage_tbl, digits = 3)
-```
+if (!nrow(filtered_cells_tbl)) {
+  stop("No object rows remained after applying the filtered-image list.", call. = FALSE)
+}
 
-Interpretation:
+passage_summary_tbl <- filtered_cells_tbl %>%
+  group_by(lineage_id, passage_id, passage_position) %>%
+  summarise(
+    n_images = n_distinct(filename),
+    n_objects = n(),
+    weighted_n = sum(p_real, na.rm = TRUE),
+    q10 = safe_quantile(log10_area, 0.10),
+    q25 = safe_quantile(log10_area, 0.25),
+    median_log10_area = safe_quantile(log10_area, 0.50),
+    q75 = safe_quantile(log10_area, 0.75),
+    q90 = safe_quantile(log10_area, 0.90),
+    .groups = "drop"
+  )
 
-- `trend_class` is the notebook's best high-level description of the long-term behavior in that lineage.
-- `smooth_delta_*` values measure start-to-end change after median smoothing across scored passages.
-- `matched_passage_fraction` shows how much of the manual lineage currently has embedding-derived area data.
-
-## Cross-Lineage Overview
-
-```{r lineage-overview-plot}
-overview_long_tbl <- all_passage_tbl %>%
-  select(lineage_id, passage_position, median_z, iqr_z, q99_z, frac_z_gt_3) %>%
-  pivot_longer(
-    cols = c(median_z, iqr_z, q99_z, frac_z_gt_3),
-    names_to = "metric",
-    values_to = "value"
+overview_tbl <- filtered_cells_tbl %>%
+  group_by(lineage_id) %>%
+  summarise(
+    surviving_images = n_distinct(filename),
+    passages_with_images = n_distinct(passage_id),
+    objects = n(),
+    .groups = "drop"
   ) %>%
-  group_by(lineage_id, metric) %>%
-  arrange(passage_position, .by_group = TRUE) %>%
-  mutate(smooth_value = smooth_series(value)) %>%
+  arrange(lineage_id)
+
+density_grid_tbl <- build_density_grid(filtered_cells_tbl)
+
+adjusted_cells_tbl <- filtered_cells_tbl %>%
+  adjust_for_confluence(log10_area, confluence)
+
+adjusted_passage_summary_tbl <- adjusted_cells_tbl %>%
+  group_by(lineage_id, passage_id, passage_position) %>%
+  summarise(
+    n_images = n_distinct(filename),
+    q10 = safe_quantile(log10_area_adj_confluence, 0.10),
+    q25 = safe_quantile(log10_area_adj_confluence, 0.25),
+    median_log10_area_adj = safe_quantile(log10_area_adj_confluence, 0.50),
+    q75 = safe_quantile(log10_area_adj_confluence, 0.75),
+    q90 = safe_quantile(log10_area_adj_confluence, 0.90),
+    .groups = "drop"
+  )
+
+adjusted_density_grid_tbl <- adjusted_cells_tbl %>%
+  transmute(
+    lineage_id,
+    passage_position,
+    log10_area = log10_area_adj_confluence
+  ) %>%
+  build_density_grid()
+
+set.seed(1)
+violin_tbl <- filtered_cells_tbl %>%
+  group_by(lineage_id, passage_position) %>%
+  group_modify(~ dplyr::slice_sample(.x, n = min(nrow(.x), 8000))) %>%
   ungroup()
 
-ggplot(overview_long_tbl, aes(x = passage_position, y = value)) +
-  geom_line(color = "grey75", linewidth = 0.5) +
-  geom_point(color = "grey55", size = 1.3) +
-  geom_line(aes(y = smooth_value, color = lineage_id), linewidth = 1) +
-  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+image_area_tbl <- filtered_cells_tbl %>%
+  group_by(lineage_id, passage_id, passage_position, filename) %>%
+  summarise(
+    median_log10_area = safe_quantile(log10_area, 0.50),
+    q25_log10_area = safe_quantile(log10_area, 0.25),
+    q75_log10_area = safe_quantile(log10_area, 0.75),
+    n_objects = n(),
+    .groups = "drop"
+  ) %>%
+  left_join(filtered_image_tbl, by = c("lineage_id", "passage_id", "passage_position", "filename")) %>%
+  left_join(
+    png_cache_index %>%
+      select(filename, png_relpath, png_abspath, png_exists),
+    by = "filename"
+  ) %>%
+  mutate(
+    png_exists = dplyr::coalesce(png_exists, FALSE)
+  )
+
+passage_crop_tbl <- image_area_tbl %>%
+  filter(png_exists) %>%
+  group_by(lineage_id, passage_position) %>%
+  group_modify(~ {
+    dat <- .x %>%
+      filter(is.finite(time_since_seeding_days)) %>%
+      arrange(time_since_seeding_days, filename)
+
+    if (!nrow(dat)) {
+      return(.x %>% slice_head(n = 1))
+    }
+
+    target_time <- stats::median(dat$time_since_seeding_days, na.rm = TRUE)
+    dat %>%
+      mutate(time_distance = abs(time_since_seeding_days - target_time)) %>%
+      slice_min(time_distance, n = 1, with_ties = FALSE) %>%
+      select(-time_distance)
+  }) %>%
+  ungroup() %>%
+  arrange(lineage_id, passage_position)
+
+correlation_base_tbl <- image_area_tbl %>%
+  select(lineage_id, passage_position, filename, median_log10_area, cell_count, time_since_seeding_days, confluence) %>%
+  residualize_by_passage(median_log10_area) %>%
+  residualize_by_passage(cell_count) %>%
+  residualize_by_passage(time_since_seeding_days) %>%
+  residualize_by_passage(confluence)
+
+correlation_vars <- c(
+  "median_log10_area_resid",
+  "cell_count_resid",
+  "time_since_seeding_days_resid",
+  "confluence_resid"
+)
+
+correlation_labels <- c(
+  median_log10_area_resid = "Median area",
+  cell_count_resid = "Cell count",
+  time_since_seeding_days_resid = "Time since seeding",
+  confluence_resid = "Confluence"
+)
+
+cor_mat <- stats::cor(
+  correlation_base_tbl[, correlation_vars],
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+correlation_tbl <- as.data.frame(as.table(cor_mat), stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  transmute(
+    var_x = factor(correlation_labels[Var1], levels = unname(correlation_labels[correlation_vars])),
+    var_y = factor(correlation_labels[Var2], levels = rev(unname(correlation_labels[correlation_vars]))),
+    rho = Freq,
+    label = sprintf("%.2f", rho)
+  )
+```
+
+## Filtered Coverage
+
+```{r filtered-coverage}
+knitr::kable(overview_tbl, digits = 1)
+```
+
+```{r filtered-passages}
+ggplot(
+  passage_summary_tbl,
+  aes(x = passage_position, y = n_images, color = lineage_id, group = lineage_id)
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = pretty_breaks()) +
   labs(
-    title = "Passage-level trajectories across the three manual lineages",
-    subtitle = "Grey points show raw passage summaries; colored lines show median-smoothed trajectories",
+    title = "Filtered image coverage along each lineage",
+    subtitle = paste("Subset:", subset_label),
     x = "Passage position",
-    y = "Summary value",
+    y = "Surviving images",
     color = "Lineage"
   ) +
   theme_minimal(base_size = 12)
 ```
 
-```{r lineage-coverage-plot}
-coverage_scale <- max(all_passage_tbl$n_manifest_images, all_passage_tbl$n_matched_images, na.rm = TRUE) /
-  max(all_passage_tbl$mean_objects_per_image, na.rm = TRUE)
-if (!is.finite(coverage_scale) || coverage_scale <= 0) {
-  coverage_scale <- 1
-}
+## Quantile Trajectories
 
-coverage_count_tbl <- all_passage_tbl %>%
-  select(lineage_id, passage_position, n_manifest_images, n_matched_images) %>%
-  pivot_longer(
-    cols = c(n_manifest_images, n_matched_images),
-    names_to = "metric",
-    values_to = "value"
-  )
-
-ggplot() +
-  geom_line(
-    data = coverage_count_tbl,
-    aes(x = passage_position, y = value, color = metric),
-    linewidth = 0.9
-  ) +
-  geom_point(
-    data = coverage_count_tbl,
-    aes(x = passage_position, y = value, color = metric),
-    size = 1.8
-  ) +
-  geom_line(
-    data = all_passage_tbl,
-    aes(
-      x = passage_position,
-      y = mean_objects_per_image * coverage_scale,
-      color = "mean_objects_per_image"
-    ),
-    linewidth = 0.9,
-    linetype = "dashed"
-  ) +
-  geom_point(
-    data = all_passage_tbl,
-    aes(
-      x = passage_position,
-      y = mean_objects_per_image * coverage_scale,
-      color = "mean_objects_per_image"
-    ),
-    size = 1.8,
-    shape = 17
-  ) +
-  facet_wrap(~ lineage_id, scales = "free_y", ncol = 1) +
-  scale_y_continuous(
-    name = "Images per passage",
-    sec.axis = sec_axis(~ . / coverage_scale, name = "Mean objects per image")
-  ) +
+```{r quantile-ribbons}
+ggplot(passage_summary_tbl, aes(x = passage_position, group = lineage_id)) +
+  geom_ribbon(aes(ymin = q10, ymax = q90, fill = lineage_id), alpha = 0.18, color = NA) +
+  geom_ribbon(aes(ymin = q25, ymax = q75, fill = lineage_id), alpha = 0.35, color = NA) +
+  geom_line(aes(y = median_log10_area, color = lineage_id), linewidth = 1) +
+  geom_point(aes(y = median_log10_area, size = n_images, color = lineage_id), alpha = 0.9) +
+  facet_wrap(~ lineage_id, scales = "free_x", ncol = 1) +
+  scale_size_continuous(range = c(1.8, 4.5), breaks = pretty_breaks()) +
+  scale_x_continuous(breaks = pretty_breaks()) +
   labs(
-    title = "Data availability along each manual lineage",
-    subtitle = "Solid lines track image counts; dashed points/line track mean objects per analyzed image",
+    title = "Passage-wise object area quantiles",
+    subtitle = "Bands show the 10-90% and 25-75% ranges; the line marks the median of log10(area_px)",
     x = "Passage position",
-    color = "Metric"
+    y = "log10(area_px)",
+    color = "Lineage",
+    fill = "Lineage",
+    size = "Images"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+## Per-Passage Distributions
+
+```{r violin-distributions}
+ggplot(violin_tbl, aes(x = passage_f, y = log10_area, fill = lineage_id)) +
+  geom_violin(scale = "width", trim = FALSE, color = NA, alpha = 0.7) +
+  geom_boxplot(
+    width = 0.14,
+    outlier.shape = NA,
+    fill = "white",
+    color = "black",
+    linewidth = 0.25
+  ) +
+  facet_wrap(~ lineage_id, scales = "free_x", ncol = 1) +
+  labs(
+    title = "Filtered object-area distributions by passage",
+    subtitle = paste("Subset:", subset_label, "| violin width reflects density within each passage"),
+    x = "Passage position",
+    y = "log10(area_px)",
+    fill = "Lineage"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+```
+
+## Density Heatmaps
+
+```{r density-heatmaps}
+ggplot(density_grid_tbl, aes(x = passage_position, y = log10_area, fill = density)) +
+  geom_raster(interpolate = TRUE) +
+  facet_wrap(~ lineage_id, scales = "free_x", ncol = 1) +
+  scale_fill_viridis_c(option = "C") +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  labs(
+    title = "Distribution shape along each lineage",
+    subtitle = paste("Subset:", subset_label, "| darker regions indicate where object-area density concentrates"),
+    x = "Passage position",
+    y = "log10(area_px)",
+    fill = "Density"
   ) +
   theme_minimal(base_size = 12)
 ```
 
-## Detailed Lineage Review
+## Representative Crops
 
-```{r detailed-lineage-review, results='asis', fig.height=8, fig.width=10}
-bundle_by_id <- stats::setNames(summary_bundle, analysis_index$lineage_id)
+```{r representative-crops, results='asis'}
+if (!nrow(passage_crop_tbl)) {
+  cat("No cached PNG crops were available for the filtered images.\n")
+} else {
+  for (lineage_name in unique(as.character(passage_crop_tbl$lineage_id))) {
+    lineage_tbl <- passage_crop_tbl %>%
+      filter(as.character(lineage_id) == lineage_name)
 
-for (lineage_id in analysis_index$lineage_id) {
-  current_lineage_id <- lineage_id
-  cat("### ", current_lineage_id, "\n\n", sep = "")
+    if (!nrow(lineage_tbl)) next
 
-  bundle <- bundle_by_id[[current_lineage_id]]
-  passage_tbl <- bundle$passage_summary %>%
-    mutate(
-      passage_position = as.integer(passage_position),
-      first_image_time = parse_datetime_safe(first_image_time)
-    ) %>%
-    arrange(passage_position) %>%
-    left_join(
-      image_passage_tbl %>% filter(lineage_id == .env$current_lineage_id),
-      by = c("passage_id", "passage_position")
+    cards <- purrr::pmap_chr(
+      list(
+        img_src = lineage_tbl$png_relpath,
+        passage = lineage_tbl$passage_position,
+        time_days = lineage_tbl$time_since_seeding_days,
+        median_area = lineage_tbl$median_log10_area
+      ),
+      function(img_src, passage, time_days, median_area) {
+        trajectory_crop_card(
+          img_src = file.path("..", img_src),
+          title_text = sprintf("%s | P%s", lineage_name, passage),
+          subtitle_text = sprintf("day %.2f | median %.2f", time_days, median_area)
+        )
+      }
     )
-  cell_tbl <- bundle$cells %>%
-    mutate(
-      passage_position = as.integer(passage_position),
-      p_real = as.numeric(p_real),
-      z = as.numeric(z)
+
+    cat(sprintf("<h3>%s</h3>", lineage_name))
+    cat(
+      "<div style=\"display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start;\">",
+      paste(cards, collapse = ""),
+      "</div>"
     )
-  summary_row <- lineage_rank_tbl %>% filter(lineage_id == .env$current_lineage_id) %>% slice_head(n = 1)
-
-  cat(summary_row$trend_statement[[1]], "\n\n")
-
-  detail_tbl <- summary_row %>%
-    transmute(
-      lineage_id,
-      trend_class,
-      n_passages,
-      n_scored_passages,
-      matched_passage_fraction,
-      long_term_score,
-      smooth_delta_median_z,
-      smooth_delta_iqr_z,
-      smooth_delta_q99_z,
-      smooth_delta_frac_z_gt_3,
-      monotonicity_median,
-      monotonicity_q99,
-      monotonicity_frac_z_gt_3
-    )
-  print(knitr::kable(detail_tbl, digits = 3))
-  cat("\n")
-
-  display_tbl <- passage_tbl %>%
-    transmute(
-      passage_position,
-      passage_id,
-      n_manifest_images,
-      n_matched_images,
-      n_objects,
-      effective_n = round(effective_n, 1),
-      nuisance_fraction = round(nuisance_fraction, 3),
-      median_z = round(median_z, 3),
-      iqr_z = round(iqr_z, 3),
-      q99_z = round(q99_z, 3),
-      frac_z_gt_3 = round(frac_z_gt_3, 3)
-    )
-  print(knitr::kable(display_tbl))
-  cat("\n")
-
-  plot_tbl <- passage_tbl %>%
-    select(passage_position, median_z, iqr_z, q99_z, frac_z_gt_3) %>%
-    pivot_longer(cols = -passage_position, names_to = "metric", values_to = "value") %>%
-    group_by(metric) %>%
-    arrange(passage_position, .by_group = TRUE) %>%
-    mutate(smooth_value = smooth_series(value)) %>%
-    ungroup()
-
-  p_metrics <- ggplot(plot_tbl, aes(x = passage_position, y = value)) +
-    geom_line(color = "grey75", linewidth = 0.5) +
-    geom_point(color = "grey55", size = 1.5) +
-    geom_line(aes(y = smooth_value), color = "#b2182b", linewidth = 1) +
-    facet_wrap(~ metric, scales = "free_y", ncol = 2) +
-    labs(
-      title = paste("Lineage", current_lineage_id, ": passage-level trajectory"),
-      subtitle = "Red line is the median-smoothed trajectory used for trend interpretation",
-      x = "Passage position",
-      y = "Summary value"
-    ) +
-    theme_minimal(base_size = 11)
-  print(p_metrics)
-
-  detailed_scale <- max(passage_tbl$n_manifest_images, passage_tbl$n_matched_images, na.rm = TRUE) /
-    max(c(passage_tbl$mean_objects_per_image, bundle$image_summary$n_objects), na.rm = TRUE)
-  if (!is.finite(detailed_scale) || detailed_scale <= 0) {
-    detailed_scale <- 1
   }
-
-  detailed_count_tbl <- passage_tbl %>%
-    select(passage_position, n_manifest_images, n_matched_images) %>%
-    pivot_longer(cols = c(n_manifest_images, n_matched_images), names_to = "metric", values_to = "value")
-
-  detailed_mean_tbl <- passage_tbl %>%
-    select(passage_position, mean_objects_per_image) %>%
-    mutate(scaled_value = mean_objects_per_image * detailed_scale)
-
-  image_point_tbl <- bundle$image_summary %>%
-    mutate(
-      passage_position = as.integer(passage_position),
-      n_objects = as.numeric(n_objects),
-      scaled_value = n_objects * detailed_scale
-    )
-
-  p_coverage <- ggplot() +
-    geom_line(
-      data = detailed_count_tbl,
-      aes(x = passage_position, y = value, color = metric),
-      linewidth = 0.9
-    ) +
-    geom_point(
-      data = detailed_count_tbl,
-      aes(x = passage_position, y = value, color = metric),
-      size = 1.8
-    ) +
-    geom_line(
-      data = detailed_mean_tbl,
-      aes(x = passage_position, y = scaled_value),
-      linewidth = 0.9,
-      linetype = "dashed",
-      color = "#b2182b"
-    ) +
-    geom_point(
-      data = image_point_tbl,
-      aes(x = passage_position, y = scaled_value),
-      inherit.aes = FALSE,
-      color = "grey35",
-      alpha = 0.55,
-      size = 1.5
-    ) +
-    scale_y_continuous(
-      name = "Images per passage",
-      sec.axis = sec_axis(~ . / detailed_scale, name = "Objects per image")
-    ) +
-    labs(
-      title = paste("Lineage", current_lineage_id, ": coverage along the lineage"),
-      subtitle = "Solid lines show image counts; grey points are per-image object counts; dashed red line is the passage mean",
-      x = "Passage position",
-      color = "Metric"
-    ) +
-    theme_minimal(base_size = 11)
-  print(p_coverage)
-
-  timepoint_tbl <- all_timepoint_tbl %>%
-    filter(lineage_id == .env$current_lineage_id) %>%
-    mutate(
-      passage_label = paste0("P", passage_position, ": ", passage_id),
-      passage_label = factor(
-        passage_label,
-        levels = rev(unique(paste0("P", passage_position, ": ", passage_id)))
-      )
-    )
-
-  if (nrow(timepoint_tbl)) {
-    p_timepoints <- ggplot(
-      timepoint_tbl,
-      aes(x = time_since_passage_start_days, y = passage_label)
-    ) +
-      geom_point(aes(size = n_images), color = "#2166ac", alpha = 0.85) +
-      scale_size_continuous(range = c(2.2, 5), breaks = pretty_breaks()) +
-      labs(
-        title = paste("Lineage", current_lineage_id, ": image timepoint availability"),
-        subtitle = "Each point is a timepoint within a passage, measured in days since that passage's first image",
-        x = "Days since first image in passage",
-        y = "Passage",
-        size = "Images"
-      ) +
-      theme_minimal(base_size = 11)
-    print(p_timepoints)
-  }
-
-  representative_passages <- choose_representative_passages(passage_tbl)
-  density_tbl <- cell_tbl %>%
-    filter(passage_id %in% representative_passages, is.finite(z), p_real >= 0.5) %>%
-    group_split(passage_id) %>%
-    purrr::map_dfr(~ dplyr::slice_sample(.x, n = min(nrow(.x), 5000))) %>%
-    mutate(
-      passage_label = paste0("P", passage_position, ": ", passage_id),
-      passage_label = factor(passage_label, levels = unique(passage_label))
-    )
-
-  if (nrow(density_tbl)) {
-    p_density <- ggplot(density_tbl, aes(x = z, fill = passage_label)) +
-      geom_density(alpha = 0.4) +
-      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
-      labs(
-        title = paste("Lineage", current_lineage_id, ": early / middle / late residual densities"),
-        subtitle = "Use this to decide whether the trend reflects center shift, tail shift, or broadening",
-        x = "Residual z",
-        y = "Density",
-        fill = "Passage"
-      ) +
-      theme_minimal(base_size = 11)
-    print(p_density)
-  }
-
-  cat("\n")
 }
 ```
 
-## Reading This Notebook
+## Residual Correlation Check
 
-Use the output in this order:
+This view uses image-level median object area from the active subset and removes lineage-specific passage-position trends before computing Spearman correlations, so the heatmap highlights residual association beyond the main trajectory shape.
 
-1. Start with the summary table to see whether each lineage looks like bulk shift, tail expansion/contraction, broadening/tightening, or no clear trend.
-2. Check the overview plots to see whether the three lineages differ in center shift, upper-tail behavior, or dispersion.
-3. For each lineage, inspect the detailed trajectory and coverage panels together before trusting any apparent plateau or jump.
-4. Use the early/mid/late density comparison to decide whether the long-term change is mainly a center shift, a tail effect, or increased heterogeneity.
+```{r residual-corrplot}
+ggplot(correlation_tbl, aes(x = var_x, y = var_y, fill = rho)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = label), size = 4) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0, limits = c(-1, 1)) +
+  labs(
+    title = "Residual correlation of image-level median object area",
+    subtitle = "Residuals are taken after within-lineage adjustment for passage position",
+    x = NULL,
+    y = NULL,
+    fill = "Spearman rho"
+  ) +
+  coord_fixed() +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+```
+
+## Confluence-Adjusted Area
+
+This section removes the within-lineage association between object area and confluence at the cell level, then shows the resulting adjusted area across passages on the same `log10(area_px)` scale.
+
+```{r adjusted-quantile-ribbons}
+ggplot(adjusted_passage_summary_tbl, aes(x = passage_position, group = lineage_id)) +
+  geom_ribbon(aes(ymin = q10, ymax = q90, fill = lineage_id), alpha = 0.18, color = NA) +
+  geom_ribbon(aes(ymin = q25, ymax = q75, fill = lineage_id), alpha = 0.35, color = NA) +
+  geom_line(aes(y = median_log10_area_adj, color = lineage_id), linewidth = 1) +
+  geom_point(aes(y = median_log10_area_adj, size = n_images, color = lineage_id), alpha = 0.9) +
+  facet_wrap(~ lineage_id, scales = "free_x", ncol = 1) +
+  scale_size_continuous(range = c(1.8, 4.5), breaks = pretty_breaks()) +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  labs(
+    title = "Passage-wise object area after confluence adjustment",
+    subtitle = paste("Subset:", subset_label, "| within each lineage, cell areas are residualized against confluence"),
+    x = "Passage position",
+    y = "Adjusted log10(area_px)",
+    color = "Lineage",
+    fill = "Lineage",
+    size = "Images"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+```{r adjusted-density-heatmaps}
+ggplot(adjusted_density_grid_tbl, aes(x = passage_position, y = log10_area, fill = density)) +
+  geom_raster(interpolate = TRUE) +
+  facet_wrap(~ lineage_id, scales = "free_x", ncol = 1) +
+  scale_fill_viridis_c(option = "C") +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  labs(
+    title = "Confluence-adjusted distribution shape along each lineage",
+    subtitle = paste("Subset:", subset_label, "| density is computed after within-lineage confluence adjustment"),
+    x = "Passage position",
+    y = "Adjusted log10(area_px)",
+    fill = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+```
 
 ## Render
 
 ```{r render-help, eval=FALSE}
 rmarkdown::render(
+  "workflows/trajectory_alignment_exemplar_lineages_streamlined.Rmd",
+  params = list(
+    filtered_export_csv = "data/lineage_area/filtered_trajectory_images.csv"
+  )
+)
+
+rmarkdown::render(
   "workflows/lineage_area_review.Rmd",
   params = list(
-    lineage_id = NULL,
     all_results_dir = "data/lineage_area",
-    manifest_csv = "manifests/image_manifest.csv",
-    show_images = TRUE,
-    max_images = 10
+    filtered_image_csv = "data/lineage_area/filtered_trajectory_images.csv",
+    image_subset_mode = "filtered_progression"
+  )
+)
+
+rmarkdown::render(
+  "workflows/lineage_area_review.Rmd",
+  params = list(
+    all_results_dir = "data/lineage_area",
+    filtered_image_csv = "data/lineage_area/filtered_trajectory_images.csv",
+    image_subset_mode = "day0_only"
   )
 )
 ```

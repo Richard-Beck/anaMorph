@@ -1,0 +1,742 @@
+---
+title: "Exemplar Lineage Trajectory Alignment"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  lineage_rds: "core_data/lineages.Rds"
+  embedding_csv: "data/all_images/manifests/raw_image_embeddings.csv"
+  manifest_csv: "manifests/image_manifest.csv"
+  filtered_export_csv: "data/lineage_area/filtered_trajectory_images.csv"
+  exemplar_lineages: null
+  control_lineage: null
+  n_top_pcs: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5
+)
+```
+
+## Overview
+
+This streamlined notebook keeps the core diagnostics for exemplar-lineage trajectory alignment and removes the exploratory side paths.
+
+```{r packages, include=FALSE}
+required_packages <- c(
+  "data.table",
+  "dplyr",
+  "ggplot2",
+  "mgcv",
+  "patchwork",
+  "purrr",
+  "readr",
+  "scales",
+  "stringr",
+  "tibble",
+  "tidyr"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    sprintf("Install required packages before rendering: %s", paste(missing_packages, collapse = ", ")),
+    call. = FALSE
+  )
+}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(patchwork)
+library(purrr)
+library(readr)
+library(scales)
+library(stringr)
+library(tibble)
+library(tidyr)
+```
+
+```{r plot-style, include=FALSE}
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      legend.position = "right"
+    )
+)
+
+lineage_palette <- c(
+  "#1B4F72",
+  "#B03A2E",
+  "#117864",
+  "#7D6608",
+  "#6C3483"
+)
+```
+
+```{r helpers, include=FALSE}
+`%||%` <- function(x, y) {
+  if (is.null(x)) y else x
+}
+
+resolve_project_root <- function() {
+  candidates <- c(
+    normalizePath(".", winslash = "/", mustWork = FALSE),
+    normalizePath("..", winslash = "/", mustWork = FALSE),
+    normalizePath("../..", winslash = "/", mustWork = FALSE)
+  )
+
+  for (candidate in unique(candidates)) {
+    if (file.exists(file.path(candidate, "README.md")) &&
+        dir.exists(file.path(candidate, "workflows"))) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate project root from current working directory.", call. = FALSE)
+}
+
+project_root <- resolve_project_root()
+
+project_path <- function(path) {
+  is_absolute <- grepl("^[A-Za-z]:[/\\\\]|^/", path)
+  out <- path
+  out[!is_absolute] <- file.path(project_root, path[!is_absolute])
+  out
+}
+
+ensure_parent_dir <- function(path) {
+  dir.create(dirname(project_path(path)), recursive = TRUE, showWarnings = FALSE)
+}
+
+parse_mixed_datetime <- function(x) {
+  x <- as.character(x)
+  out <- as.POSIXct(rep(NA_character_, length(x)), tz = "UTC")
+  formats <- c(
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y %H:%M:%S"
+  )
+
+  for (fmt in formats) {
+    missing <- is.na(out) & !is.na(x) & nzchar(x)
+    if (!any(missing)) next
+    out[missing] <- as.POSIXct(x[missing], format = fmt, tz = "UTC")
+  }
+
+  out
+}
+
+embedding_column_names <- function(x) {
+  grep("^embedding_[0-9]{3}$", names(x), value = TRUE)
+}
+
+extract_lineage <- function(lineages, lineage_id) {
+  if (lineage_id %in% names(lineages)) {
+    return(lineages[[lineage_id]])
+  }
+
+  hit <- vapply(lineages, function(x) identical(as.character(x$lineage_id), as.character(lineage_id)), logical(1))
+  if (!any(hit)) {
+    stop(sprintf("Lineage id not found: %s", lineage_id), call. = FALSE)
+  }
+
+  lineages[[which(hit)[[1]]]]
+}
+
+build_lineage_image_meta <- function(lineage_obj) {
+  passage_positions <- stats::setNames(seq_along(lineage_obj$passage_ids), lineage_obj$passage_ids)
+
+  image_meta_list <- lapply(names(lineage_obj$passages), function(passage_id) {
+    passage_dt <- data.table::as.data.table(lineage_obj$passages[[passage_id]])
+    if (!nrow(passage_dt)) return(NULL)
+
+    keep_cols <- intersect(
+      c("id", "filename", "field", "date", "areaOccupied_um2", "cellCount", "condition_label", "event", "passage"),
+      names(passage_dt)
+    )
+    image_meta <- unique(passage_dt[, ..keep_cols], by = "filename")
+    image_meta[, passage_id := as.character(passage_id)]
+    image_meta[, lineage_id := as.character(lineage_obj$lineage_id)]
+    image_meta[, passage_position := unname(passage_positions[passage_id])]
+    image_meta
+  })
+
+  image_meta <- data.table::rbindlist(image_meta_list, fill = TRUE)
+  if (!nrow(image_meta)) {
+    stop(sprintf("No manifest rows found in lineage %s.", lineage_obj$lineage_id), call. = FALSE)
+  }
+
+  image_meta[, image_time := parse_mixed_datetime(date)]
+  image_meta[, passage_start_time := suppressWarnings(min(image_time, na.rm = TRUE)), by = passage_id]
+  image_meta[!is.finite(as.numeric(passage_start_time)), passage_start_time := as.POSIXct(NA, tz = "UTC")]
+  image_meta[, time_since_seeding_hours := as.numeric(difftime(image_time, passage_start_time, units = "hours"))]
+  image_meta[, time_since_seeding_days := time_since_seeding_hours / 24]
+  image_meta[, confluence := suppressWarnings(as.numeric(areaOccupied_um2))]
+  image_meta[, cell_count := suppressWarnings(as.numeric(cellCount))]
+  image_meta[, log_confluence := log1p(pmax(confluence, 0))]
+  image_meta[, log_cell_count := log1p(pmax(cell_count, 0))]
+
+  image_meta
+}
+
+choose_exemplar_lineages <- function(lineages, embedding_tbl, n = 3L) {
+  coverage_tbl <- purrr::map_dfr(names(lineages), function(lineage_name) {
+    lineage_obj <- lineages[[lineage_name]]
+    meta <- build_lineage_image_meta(lineage_obj)
+    tibble(
+      lineage_id = as.character(lineage_obj$lineage_id),
+      n_manifest_images = nrow(meta),
+      n_matched_images = sum(meta$filename %in% embedding_tbl$filename)
+    )
+  })
+
+  coverage_tbl %>%
+    arrange(desc(n_matched_images), desc(n_manifest_images), lineage_id) %>%
+    slice_head(n = n) %>%
+    pull(lineage_id)
+}
+
+load_exemplar_panel <- function(lineage_rds, embedding_csv, exemplar_lineages = NULL) {
+  lineages <- readRDS(project_path(lineage_rds))
+  embedding_tbl <- data.table::fread(project_path(embedding_csv)) %>%
+    as_tibble()
+
+  embedding_cols <- embedding_column_names(embedding_tbl)
+  if (!length(embedding_cols)) {
+    stop("No embedding columns were found in the image-level embedding CSV.", call. = FALSE)
+  }
+
+  if (is.null(exemplar_lineages) || !length(exemplar_lineages)) {
+    exemplar_lineages <- choose_exemplar_lineages(lineages, embedding_tbl, n = 3L)
+  }
+
+  lineage_meta <- purrr::map_dfr(exemplar_lineages, function(lineage_id) {
+    build_lineage_image_meta(extract_lineage(lineages, lineage_id)) %>% as_tibble()
+  })
+
+  if (!nrow(lineage_meta)) {
+    stop("No lineage metadata rows were recovered for the exemplar lineages.", call. = FALSE)
+  }
+
+  joined <- lineage_meta %>%
+    inner_join(embedding_tbl, by = "filename")
+
+  if (!nrow(joined)) {
+    stop("No exemplar-lineage images matched the embedding CSV.", call. = FALSE)
+  }
+
+  joined %>%
+    mutate(
+      lineage_id = factor(lineage_id, levels = exemplar_lineages),
+      passage_position = as.integer(passage_position)
+    ) %>%
+    distinct(lineage_id, passage_id, filename, .keep_all = TRUE)
+}
+
+rescale01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!all(is.finite(rng)) || diff(rng) <= 0) {
+    return(rep(NA_real_, length(x)))
+  }
+  (x - rng[1]) / diff(rng)
+}
+
+load_png_cache_index <- function(manifest_csv = "manifests/image_manifest.csv", area_dir = "data/lineage_area", out_root = "data/lineage_png") {
+  manifest_tbl <- readr::read_csv(project_path(manifest_csv), show_col_types = FALSE) %>%
+    filter(artifact_type == "raw_image") %>%
+    distinct(filename, filepath, .keep_all = TRUE)
+
+  image_summary_files <- list.files(project_path(area_dir), pattern = "image_summary\\.csv$", recursive = TRUE, full.names = TRUE)
+
+  if (!length(image_summary_files)) {
+    return(tibble(
+      filename = character(),
+      raw_filepath = character(),
+      png_relpath = character(),
+      png_abspath = character(),
+      png_exists = logical(),
+      cache_lineage_id = character()
+    ))
+  }
+
+  purrr::map_dfr(image_summary_files, function(path) {
+    lineage_dir <- basename(dirname(path))
+
+    readr::read_csv(path, show_col_types = FALSE) %>%
+      distinct(filename, .keep_all = TRUE) %>%
+      transmute(
+        filename,
+        cache_lineage_id = sub("^lineage_", "", lineage_dir)
+      ) %>%
+      left_join(manifest_tbl %>% transmute(filename, raw_filepath = filepath), by = "filename") %>%
+      mutate(
+        png_relpath = file.path(out_root, lineage_dir, sub("\\.[^.]+$", ".png", basename(filename))),
+        png_abspath = project_path(png_relpath),
+        png_exists = file.exists(png_abspath)
+      )
+  }) %>%
+    distinct(filename, .keep_all = TRUE)
+}
+
+pick_evenly_spaced_images <- function(df, n_keep = 12L) {
+  dat <- df %>%
+    filter(is.finite(latent_score), !is.na(png_exists), png_exists) %>%
+    arrange(latent_score)
+
+  if (!nrow(dat)) {
+    return(dat)
+  }
+
+  if (nrow(dat) <= n_keep) {
+    return(
+      dat %>%
+        mutate(selection_rank = row_number())
+    )
+  }
+
+  targets <- seq(0.025, 0.975, length.out = n_keep)
+  picked_rows <- integer(0)
+
+  for (target in targets) {
+    remaining_idx <- setdiff(seq_len(nrow(dat)), picked_rows)
+    remaining <- dat[remaining_idx, , drop = FALSE]
+    if (!nrow(remaining)) break
+
+    chosen <- remaining %>%
+      mutate(distance_to_target = abs(latent_score - target)) %>%
+      slice_min(distance_to_target, n = 1, with_ties = FALSE)
+
+    picked_rows <- c(picked_rows, match(chosen$filename[[1]], dat$filename))
+  }
+
+  dat[picked_rows, , drop = FALSE] %>%
+    distinct(filename, .keep_all = TRUE) %>%
+    arrange(latent_score) %>%
+    mutate(selection_rank = row_number())
+}
+
+robust_high_confluence <- function(x, prob = 0.99) {
+  x <- x[is.finite(x)]
+  if (!length(x)) {
+    return(NA_real_)
+  }
+  as.numeric(stats::quantile(x, probs = prob, na.rm = TRUE, names = FALSE))
+}
+
+trajectory_crop_card <- function(img_src, title_text, subtitle_text, crop_scale = sqrt(10)) {
+  sprintf(
+    paste0(
+      "<div style=\"width:150px;\">",
+      "<div style=\"width:150px;height:112px;overflow:hidden;border:1px solid #d0d0d0;background:#fafafa;\">",
+      "<img src=\"%s\" style=\"width:100%%;height:100%%;object-fit:cover;transform:scale(%.4f);transform-origin:center center;display:block;\" />",
+      "</div>",
+      "<div style=\"font-size:11px;line-height:1.25;margin-top:4px;\">",
+      "<div><strong>%s</strong></div>",
+      "<div>%s</div>",
+      "</div></div>"
+    ),
+    img_src,
+    crop_scale,
+    title_text,
+    subtitle_text
+  )
+}
+
+fit_shared_pc12_curve <- function(df, grid_n = 500L) {
+  dat <- df %>%
+    filter(is.finite(PC1), is.finite(PC2), is.finite(time_since_seeding_days))
+
+  if (nrow(dat) < 10 || dplyr::n_distinct(round(dat$PC1, 4)) < 6) {
+    stop("Too few distinct PC1/PC2 points to fit a shared spline trajectory.", call. = FALSE)
+  }
+
+  k_basis <- min(7, max(4, floor(dplyr::n_distinct(round(dat$PC1, 3)) / 6)))
+  spline_fit <- mgcv::gam(PC2 ~ s(PC1, k = k_basis, bs = "cr"), data = dat, method = "REML")
+
+  x_grid <- seq(min(dat$PC1, na.rm = TRUE), max(dat$PC1, na.rm = TRUE), length.out = grid_n)
+  y_grid <- as.numeric(predict(spline_fit, newdata = tibble(PC1 = x_grid)))
+
+  step_len <- c(0, sqrt(diff(x_grid)^2 + diff(y_grid)^2))
+  lambda <- cumsum(step_len)
+
+  grid_tbl <- tibble(
+    PC1 = x_grid,
+    PC2 = y_grid,
+    lambda = lambda
+  )
+
+  nearest_idx <- vapply(seq_len(nrow(dat)), function(i) {
+    which.min((grid_tbl$PC1 - dat$PC1[[i]])^2 + (grid_tbl$PC2 - dat$PC2[[i]])^2)
+  }, integer(1))
+
+  projection_tbl <- dat %>%
+    mutate(
+      curve_PC1 = grid_tbl$PC1[nearest_idx],
+      curve_PC2 = grid_tbl$PC2[nearest_idx],
+      lambda = grid_tbl$lambda[nearest_idx],
+      distance_to_curve = sqrt((PC1 - curve_PC1)^2 + (PC2 - curve_PC2)^2)
+    )
+
+  lambda_cor <- suppressWarnings(cor(projection_tbl$lambda, projection_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman"))
+  if (is.finite(lambda_cor) && lambda_cor < 0) {
+    lambda_max <- max(grid_tbl$lambda, na.rm = TRUE)
+    grid_tbl <- grid_tbl %>%
+      mutate(lambda = lambda_max - lambda) %>%
+      arrange(lambda)
+    projection_tbl <- projection_tbl %>%
+      mutate(lambda = lambda_max - lambda)
+  }
+
+  list(
+    curve_path_tbl = grid_tbl,
+    curve_projection_tbl = projection_tbl
+  )
+}
+```
+
+```{r load-data, include=FALSE}
+panel_tbl <- load_exemplar_panel(
+  lineage_rds = params$lineage_rds,
+  embedding_csv = params$embedding_csv,
+  exemplar_lineages = params$exemplar_lineages
+)
+
+png_cache_index <- load_png_cache_index(manifest_csv = params$manifest_csv)
+
+embedding_cols <- embedding_column_names(panel_tbl)
+
+analysis_tbl <- panel_tbl %>%
+  mutate(
+    lineage_id = factor(lineage_id, levels = unique(lineage_id)),
+    passage_label = paste0("P", passage_position)
+  )
+
+lineage_levels <- levels(analysis_tbl$lineage_id)
+```
+
+## Sample Coverage by Lineage and Passage
+
+```{r coverage-plots}
+coverage_tbl <- analysis_tbl %>%
+  dplyr::count(lineage_id, passage_position, time_since_seeding_days, name = "n_images")
+
+ggplot(coverage_tbl, aes(x = time_since_seeding_days, y = factor(passage_position), size = n_images, color = lineage_id)) +
+  geom_point(alpha = 0.8) +
+  scale_size_continuous(range = c(2.5, 7)) +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Sampling coverage by lineage, passage, and time since seeding",
+    x = "Time since seeding (days)",
+    y = "Passage position",
+    color = "Lineage",
+    size = "Images"
+  )
+```
+
+## Confluence and Cell Count Versus Time Since Seeding
+
+```{r covariate-pairs}
+covariate_long <- analysis_tbl %>%
+  select(lineage_id, passage_position, time_since_seeding_days, confluence, cell_count) %>%
+  pivot_longer(
+    cols = c(confluence, cell_count),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(covariate_long, aes(x = time_since_seeding_days, y = value, color = lineage_id)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.8, linewidth = 0.8) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Confluence and cell count versus time since seeding",
+    x = "Time since seeding (days)",
+    y = NULL,
+    color = "Lineage"
+  )
+```
+
+## PCA Variance Explained
+
+```{r pca, include=FALSE}
+complete_tbl <- analysis_tbl %>%
+  filter(
+    if_all(all_of(embedding_cols), is.finite),
+    is.finite(time_since_seeding_days)
+  )
+
+embedding_mat <- as.matrix(complete_tbl[, embedding_cols])
+storage.mode(embedding_mat) <- "double"
+
+pca_fit <- prcomp(embedding_mat, center = TRUE, scale. = TRUE)
+
+n_top_pcs <- min(params$n_top_pcs, ncol(pca_fit$x))
+score_cols <- paste0("PC", seq_len(n_top_pcs))
+score_tbl <- bind_cols(
+  complete_tbl %>% select(-all_of(embedding_cols)),
+  as_tibble(pca_fit$x[, seq_len(n_top_pcs), drop = FALSE], .name_repair = "minimal")
+)
+names(score_tbl)[(ncol(score_tbl) - n_top_pcs + 1):ncol(score_tbl)] <- score_cols
+
+var_explained <- (pca_fit$sdev^2) / sum(pca_fit$sdev^2)
+var_tbl <- tibble(
+  pc = paste0("PC", seq_along(var_explained)),
+  variance_explained = var_explained,
+  cumulative_variance = cumsum(var_explained)
+)
+```
+
+```{r variance-explained}
+ggplot(var_tbl %>% slice_head(n = 15), aes(x = reorder(pc, variance_explained), y = variance_explained)) +
+  geom_col(fill = "#2C7FB8") +
+  geom_text(aes(label = percent(variance_explained, accuracy = 0.1)), hjust = -0.05, size = 3.2) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Variance explained by the leading principal components",
+    x = NULL,
+    y = "Fraction of total embedding variance"
+  )
+```
+
+## PCA State Space Views
+
+```{r pca-color-views}
+pca_by_lineage_plot <- ggplot(score_tbl, aes(x = PC1, y = PC2, color = lineage_id)) +
+  geom_point(alpha = 0.8, size = 2.2) +
+  stat_ellipse(linewidth = 0.7, alpha = 0.4) +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Colored by lineage",
+    x = "PC1",
+    y = "PC2",
+    color = "Lineage"
+  )
+
+plot_by_numeric <- function(var_name, title_text) {
+  ggplot(score_tbl, aes(x = PC1, y = PC2, color = .data[[var_name]])) +
+    geom_point(size = 2.1, alpha = 0.85) +
+    scale_color_viridis_c(option = "C", na.value = "grey80") +
+    labs(
+      title = title_text,
+      x = "PC1",
+      y = "PC2",
+      color = var_name
+    )
+}
+
+pca_by_confluence_plot <- plot_by_numeric("confluence", "Colored by confluence")
+pca_by_cell_count_plot <- plot_by_numeric("cell_count", "Colored by cell count")
+pca_by_time_plot <- plot_by_numeric("time_since_seeding_days", "Colored by time since seeding")
+
+(pca_by_lineage_plot + pca_by_confluence_plot) /
+  (pca_by_cell_count_plot + pca_by_time_plot) +
+  plot_annotation(title = "PCA state space views")
+```
+
+```{r latent-prep, include=FALSE}
+pc1_oriented <- score_tbl$PC1
+if (stats::cor(pc1_oriented, score_tbl$time_since_seeding_days, use = "pairwise.complete.obs", method = "spearman") < 0) {
+  pc1_oriented <- -pc1_oriented
+}
+
+latent_tbl <- score_tbl %>%
+  mutate(
+    latent_score = rescale01(pc1_oriented),
+    distance_to_curve = NA_real_
+  )
+
+curve_path_tbl <- tibble(
+  PC1 = numeric(),
+  PC2 = numeric(),
+  lambda = numeric()
+)
+
+shared_curve_fit <- tryCatch(
+  fit_shared_pc12_curve(score_tbl),
+  error = function(e) NULL
+)
+
+if (!is.null(shared_curve_fit)) {
+  curve_path_tbl <- shared_curve_fit$curve_path_tbl
+
+  latent_tbl <- latent_tbl %>%
+    select(-distance_to_curve) %>%
+    left_join(
+      shared_curve_fit$curve_projection_tbl %>%
+        transmute(
+          filename,
+          latent_score = rescale01(lambda),
+          distance_to_curve = distance_to_curve
+        ),
+      by = "filename",
+      suffix = c("_pc1", "")
+    ) %>%
+    mutate(
+      latent_score = coalesce(latent_score, latent_score_pc1)
+    ) %>%
+    select(-latent_score_pc1)
+}
+```
+
+```{r filtered-trajectory-prep, include=FALSE}
+latent_tbl <- latent_tbl %>%
+  left_join(
+    png_cache_index %>%
+      select(filename, raw_filepath, png_relpath, png_abspath, png_exists, cache_lineage_id),
+    by = "filename"
+  ) %>%
+  mutate(
+    png_exists = dplyr::coalesce(png_exists, FALSE)
+  )
+
+confluence_reference_max <- robust_high_confluence(
+  latent_tbl$confluence[is.finite(latent_tbl$time_since_seeding_days) & latent_tbl$time_since_seeding_days > 0],
+  prob = 0.99
+)
+confluence_keep_threshold <- 0.70 * confluence_reference_max
+
+filtered_tbl <- latent_tbl %>%
+  filter(
+    is.finite(time_since_seeding_days),
+    time_since_seeding_days > 0,
+    is.finite(confluence),
+    confluence <= confluence_keep_threshold
+  )
+
+filtered_export_tbl <- filtered_tbl %>%
+  transmute(
+    lineage_id,
+    passage_id,
+    passage_position,
+    filename,
+    time_since_seeding_days,
+    confluence,
+    cell_count,
+    latent_score,
+    confluence_reference_max,
+    confluence_keep_threshold
+  ) %>%
+  distinct(lineage_id, passage_id, passage_position, filename, .keep_all = TRUE) %>%
+  arrange(lineage_id, passage_position, time_since_seeding_days, filename)
+
+ensure_parent_dir(params$filtered_export_csv)
+readr::write_csv(filtered_export_tbl, project_path(params$filtered_export_csv))
+
+filtered_crop_tbl <- filtered_tbl %>%
+  group_by(lineage_id) %>%
+  group_modify(~ pick_evenly_spaced_images(.x, n_keep = 12L)) %>%
+  ungroup()
+
+passage_dist_plots <- purrr::map(lineage_levels, function(lineage_id) {
+  plot_tbl <- filtered_tbl %>%
+    filter(lineage_id == .env$lineage_id) %>%
+    count(passage_position, name = "n_images")
+
+  ggplot(plot_tbl, aes(x = factor(passage_position), y = n_images)) +
+    geom_col(fill = lineage_palette[match(lineage_id, lineage_levels)]) +
+    labs(
+      title = paste("Passage distribution:", lineage_id),
+      x = "Passage position",
+      y = "Surviving images"
+    )
+})
+```
+
+## Filtered Trajectory in PCA Space
+
+Images are retained only if `time_since_seeding_days > 0` and `confluence <= 70%` of a robust high-confluence reference, where the reference is the 99th percentile of nonzero-time confluence.
+
+```{r filtered-trajectory-pca}
+filtered_pca_plot <- ggplot(latent_tbl, aes(x = PC1, y = PC2)) +
+  geom_point(color = "grey82", alpha = 0.45, size = 1.5) +
+  geom_point(
+    data = filtered_tbl,
+    aes(color = lineage_id),
+    alpha = 0.85,
+    size = 2.1
+  ) +
+  scale_color_manual(values = lineage_palette[seq_along(lineage_levels)]) +
+  labs(
+    title = "Filtered trajectory view in PCA space",
+    subtitle = paste0(
+      "Reference max confluence = ", scales::label_number(accuracy = 0.1, scale_cut = scales::cut_short_scale())(confluence_reference_max),
+      "; keep threshold = ", scales::label_number(accuracy = 0.1, scale_cut = scales::cut_short_scale())(confluence_keep_threshold),
+      "; surviving images = ", nrow(filtered_tbl)
+    ),
+    x = "PC1",
+    y = "PC2",
+    color = "Lineage"
+  )
+
+if (nrow(curve_path_tbl) >= 2) {
+  filtered_pca_plot <- filtered_pca_plot +
+    geom_path(
+      data = curve_path_tbl,
+      mapping = aes(x = PC1, y = PC2),
+      inherit.aes = FALSE,
+      linewidth = 1.1,
+      color = "black"
+    )
+}
+
+filtered_pca_plot
+```
+
+## Passage Distributions of Surviving Images
+
+```{r filtered-passage-distributions}
+wrap_plots(passage_dist_plots, ncol = 1)
+```
+
+## Representative Filtered Crops
+
+These crops use the center 10% of each cached lineage PNG. Within each lineage, up to 12 images are sampled to span the filtered latent trajectory; if fewer than 12 images survive the filter, all survivors are shown.
+
+```{r filtered-crop-gallery, results='asis'}
+if (!nrow(filtered_crop_tbl)) {
+  cat("No filter-passing cached PNGs were available.\n")
+} else {
+  for (lineage_id in lineage_levels) {
+    lineage_tbl <- filtered_crop_tbl %>%
+      filter(lineage_id == .env$lineage_id)
+
+    if (!nrow(lineage_tbl)) next
+
+    cards <- purrr::pmap_chr(
+      list(
+        img_src = lineage_tbl$png_relpath,
+        rank = lineage_tbl$selection_rank,
+        passage = lineage_tbl$passage_position,
+        time_days = lineage_tbl$time_since_seeding_days
+      ),
+      function(img_src, rank, passage, time_days) {
+        trajectory_crop_card(
+          img_src = file.path("..", img_src),
+          title_text = sprintf("%s #%02d", lineage_id, rank),
+          subtitle_text = sprintf("P%s | day %.2f", passage, time_days)
+        )
+      }
+    )
+
+    cat(sprintf("<h3>%s (%d shown)</h3>", lineage_id, nrow(lineage_tbl)))
+    cat(
+      "<div style=\"display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start;\">",
+      paste(cards, collapse = ""),
+      "</div>"
+    )
+  }
+}
+```

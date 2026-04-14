@@ -6,3 +6,4 @@ data/dev_unsupervised_analysis/
 data/
 data/all_images/
 logs/
+*.html
